@@ -1,0 +1,1510 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Rosario · Réconciliation</title>
+<link rel="icon" type="image/png" href="favicon.png">
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: 'Sora', system-ui, sans-serif; background: #f7f6f3; color: #2a241f; }
+  button:hover { opacity: .92; }
+  tr:hover td { background: rgba(139,26,26,0.02); }
+</style>
+</head>
+<body>
+<div id="root">
+  <div style="padding:60px;text-align:center;color:#8a7d70;font-family:sans-serif;">Chargement…</div>
+</div>
+
+<!-- Aucune installation nécessaire : tout tourne dans le navigateur.
+     React + le parseur CSV se chargent depuis un CDN au premier lancement
+     (comme les polices Google ci-dessus) — pas de Babel/JSX ici, du
+     JavaScript pur, pour que ça marche de façon fiable en ouvrant le
+     fichier directement (file://). -->
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+<script>
+const { useState, useMemo, useCallback, useEffect } = React;
+const e = React.createElement;
+
+// ————————————————————————————————————————————————————————
+// Backend Google Sheets (Apps Script) — même pattern que
+// caisse.grupodomingo.io : Web App, dispatch par "action", JSONP pour lire
+// (contourne les soucis CORS), fetch GET/POST classique pour écrire.
+// Projet Apps Script séparé de celui de caisse (aucun risque pour la prod).
+// ————————————————————————————————————————————————————————
+const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwlPFi6zfhU9-Bzj8Lz6KEdNdGskfEVntOE7XX8penAlzLjfYKMccv8X9YgtLxShnK18Q/exec";
+// Le déploiement Apps Script doit rester "Anyone" (nécessaire pour le JSONP
+// ci-dessous), donc cette clé sert de verrou minimal contre un accès direct
+// au Sheet par quelqu'un qui devine/scanne l'URL sans jamais avoir vu cette
+// page — DOIT être identique à RECON_ACCESS_KEY dans Code.gs (à changer là
+// -bas ET ici si vous voulez une valeur différente de celle par défaut). Ce
+// n'est pas un vrai secret (page publique) : à combiner avec un mot de passe
+// sur la page elle-même (ex. StatiCrypt) pour une vraie protection.
+const RECON_ACCESS_KEY = "rk_8f3n2q7xTz51LmPa9WcE4hYs0uBv6R";
+
+let jsonpCounter = 0;
+function jsonp(url) {
+  return new Promise((resolve, reject) => {
+    const cbName = `_recon_cb_${Date.now()}_${jsonpCounter++}`;
+    const script = document.createElement("script");
+    window[cbName] = (data) => { resolve(data); delete window[cbName]; script.remove(); };
+    script.onerror = () => { reject(new Error("JSONP request failed")); delete window[cbName]; script.remove(); };
+    script.src = `${url}${url.includes("?") ? "&" : "?"}callback=${cbName}&t=${Date.now()}`;
+    document.head.appendChild(script);
+  });
+}
+// Chaque appel JSONP est borné dans le temps : si le callback ne se
+// déclenche jamais (ex. déploiement Apps Script qui répond par une page de
+// consentement/login au lieu du JS attendu — ça arrive si "Qui a accès"
+// n'est pas réglé sur "Tout le monde"), la Promise ne se résout ni ne
+// rejette jamais, ce qui bloquait tout le chargement sur "Connexion au
+// Sheet…" indéfiniment sans jamais basculer en erreur.
+// Fabrique commune pour les 4 lectures JSONP simples (get_journalier,
+// get_depots, get_fond_caisse, get_repartitions) — même forme à chaque fois
+// (timeout 12s, fallback silencieux si SCRIPT_URL absent ou erreur/timeout),
+// seuls l'action et la valeur de repli (tableau ou objet vide) changent.
+function fetchAction_(action, fallback) {
+  return async () => {
+    if (!SCRIPT_URL) return fallback;
+    try {
+      const data = await withTimeout(jsonp(`${SCRIPT_URL}?action=${action}&key=${encodeURIComponent(RECON_ACCESS_KEY)}`), 12000);
+      return data && data.status === "ok" ? data.rows : fallback;
+    } catch (err) { return fallback; }
+  };
+}
+const fetchJournalier = fetchAction_("get_journalier", []);
+const fetchDepots = fetchAction_("get_depots", []);
+const fetchFondCaisse = fetchAction_("get_fond_caisse", {});
+function serializeParams(obj) {
+  const params = new URLSearchParams();
+  Object.entries(obj).forEach(([k, v]) => { if (v !== undefined && v !== null) params.set(k, String(v)); });
+  return params;
+}
+function saveJourFireAndForget(row) {
+  if (!SCRIPT_URL) return;
+  const params = serializeParams({ action: "save_jour", key: RECON_ACCESS_KEY, ...row });
+  fetch(`${SCRIPT_URL}?${params.toString()}`).catch(() => {});
+}
+async function validerDepotRequest(depot) {
+  if (!SCRIPT_URL) return;
+  const params = serializeParams({ action: "valider_depot", key: RECON_ACCESS_KEY, ...depot });
+  try { await fetch(`${SCRIPT_URL}?${params.toString()}`); } catch (err) {}
+}
+async function supprimerDernierDepotRequest() {
+  if (!SCRIPT_URL) return { status: "error" };
+  try {
+    const data = await withTimeout(jsonp(`${SCRIPT_URL}?action=supprimer_dernier_depot&key=${encodeURIComponent(RECON_ACCESS_KEY)}`), 15000);
+    return data || { status: "error" };
+  } catch (err) { return { status: "error" }; }
+}
+async function importJournalierBulk(rows) {
+  if (!SCRIPT_URL || rows.length === 0) return;
+  try {
+    await fetch(SCRIPT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ rows, key: RECON_ACCESS_KEY }),
+    });
+  } catch (err) {}
+}
+const fetchRepartitions = fetchAction_("get_repartitions", []);
+async function validerRepartitionRequest(payload) {
+  if (!SCRIPT_URL) return;
+  try {
+    await fetch(SCRIPT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ action: "valider_repartition", key: RECON_ACCESS_KEY, ...payload }),
+    });
+  } catch (err) {}
+}
+
+// Assistant Claude : on avait initialement envoyé la question en POST
+// "fire and forget" (réponse illisible en CORS) puis relu la réponse via un
+// cache côté script interrogé en boucle par JSONP GET. Diagnostic (journal
+// "Exécutions" d'Apps Script, 8/07) : les POST vers /exec n'apparaissent
+// JAMAIS comme exécutions "doPost" — seuls les GET (JSONP) s'exécutent
+// vraiment. Cause probable : Apps Script redirige (302) le premier appel
+// vers l'URL d'exécution réelle, et un POST redirigé en 302 est
+// automatiquement reconverti en GET par le navigateur (spec fetch), donc le
+// corps de la requête (l'action, la question…) est perdu en route.
+// Fix : tout passe désormais par UN SEUL appel JSONP GET, question/contexte/
+// historique en paramètres d'URL — même mécanisme que le reste de l'app,
+// dont on sait qu'il fonctionne de façon fiable (des dizaines d'exécutions
+// "doGet" réussies dans le journal).
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), ms)),
+  ]);
+}
+async function askClaudeRequest(question, context, history) {
+  if (!SCRIPT_URL) return "Assistant indisponible : Google Sheets n'est pas connecté.";
+  // Historique tronqué (6 derniers messages) pour garder une URL raisonnable.
+  const trimmedHistory = (history || []).slice(-6);
+  const params = serializeParams({
+    action: "ask_claude_sync",
+    key: RECON_ACCESS_KEY,
+    question,
+    context: JSON.stringify(context || {}),
+    history: JSON.stringify(trimmedHistory),
+  });
+  try {
+    const data = await withTimeout(jsonp(`${SCRIPT_URL}?${params.toString()}`), 30000);
+    if (data && data.status === "ok" && data.answer !== undefined) return data.answer;
+    return "Réponse inattendue de l'assistant. Vérifie dans Apps Script (menu \"Exécutions\") l'appel ask_claude_sync le plus récent pour voir l'erreur exacte.";
+  } catch (err) {
+    return "L'assistant n'a pas répondu à temps (>30s). Vérifie dans l'éditeur Apps Script (menu \"Exécutions\") qu'un appel ask_claude_sync apparaît bien : aucun appel → redéploie (Gérer les déploiements > crayon > Nouvelle version) ; un appel en erreur → regarde le message affiché (souvent ANTHROPIC_API_KEY manquante).";
+  }
+}
+
+// ————————————————————————————————————————————————————————
+// Icônes (SVG minimalistes, pas de dépendance externe)
+// ————————————————————————————————————————————————————————
+function Icon({ name, size = 16, color = "currentColor" }) {
+  const p = { width: size, height: size, viewBox: "0 0 24 24", fill: "none", stroke: color, strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" };
+  switch (name) {
+    case "check": return e("svg", p, e("polyline", { points: "20 6 9 17 4 12" }));
+    case "alert": return e("svg", p,
+      e("path", { d: "M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" }),
+      e("line", { x1: 12, y1: 9, x2: 12, y2: 13 }),
+      e("line", { x1: 12, y1: 17, x2: 12.01, y2: 17 })
+    );
+    case "building": return e("svg", p,
+      e("path", { d: "M3 21h18" }),
+      e("path", { d: "M5 21V7l7-4 7 4v14" }),
+      e("path", { d: "M9 21v-6h6v6" })
+    );
+    case "banknote": return e("svg", p,
+      e("rect", { x: 2, y: 6, width: 20, height: 12, rx: 2 }),
+      e("circle", { cx: 12, cy: 12, r: 2 }),
+      e("path", { d: "M6 12h.01M18 12h.01" })
+    );
+    case "card": return e("svg", p,
+      e("rect", { x: 2, y: 5, width: 20, height: 14, rx: 2 }),
+      e("line", { x1: 2, y1: 10, x2: 22, y2: 10 })
+    );
+    case "qrcode": return e("svg", p,
+      e("rect", { x: 3, y: 3, width: 7, height: 7 }),
+      e("rect", { x: 14, y: 3, width: 7, height: 7 }),
+      e("rect", { x: 3, y: 14, width: 7, height: 7 }),
+      e("rect", { x: 14, y: 14, width: 3, height: 3 }),
+      e("rect", { x: 18, y: 14, width: 3, height: 3 }),
+      e("rect", { x: 14, y: 18, width: 3, height: 3 }),
+      e("rect", { x: 18, y: 18, width: 3, height: 3 })
+    );
+    case "coins": return e("svg", p,
+      e("circle", { cx: 9, cy: 9, r: 6 }),
+      e("path", { d: "M18.5 10.5a6 6 0 1 1-8-8" })
+    );
+    case "filedown": return e("svg", p,
+      e("path", { d: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" }),
+      e("polyline", { points: "14 2 14 8 20 8" }),
+      e("line", { x1: 12, y1: 18, x2: 12, y2: 12 }),
+      e("polyline", { points: "9 15 12 18 15 15" })
+    );
+    case "calendar": return e("svg", p,
+      e("rect", { x: 3, y: 4, width: 18, height: 18, rx: 2 }),
+      e("line", { x1: 16, y1: 2, x2: 16, y2: 6 }),
+      e("line", { x1: 8, y1: 2, x2: 8, y2: 6 }),
+      e("line", { x1: 3, y1: 10, x2: 21, y2: 10 })
+    );
+    case "pencil": return e("svg", p, e("path", { d: "M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z" }));
+    case "chevron": return e("svg", p, e("polyline", { points: "9 18 15 12 9 6" }));
+    case "lock": return e("svg", p,
+      e("rect", { x: 3, y: 11, width: 18, height: 11, rx: 2 }),
+      e("path", { d: "M7 11V7a5 5 0 0 1 10 0v4" })
+    );
+    case "users": return e("svg", p,
+      e("path", { d: "M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" }),
+      e("circle", { cx: 9, cy: 7, r: 4 }),
+      e("path", { d: "M23 21v-2a4 4 0 0 0-3-3.87" }),
+      e("path", { d: "M16 3.13a4 4 0 0 1 0 7.75" })
+    );
+    case "arrowupright": return e("svg", p, e("line", { x1: 7, y1: 17, x2: 17, y2: 7 }), e("polyline", { points: "7 7 17 7 17 17" }));
+    case "upload": return e("svg", p,
+      e("path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }),
+      e("polyline", { points: "17 8 12 3 7 8" }),
+      e("line", { x1: 12, y1: 3, x2: 12, y2: 15 })
+    );
+    case "filewarning": return e("svg", p,
+      e("path", { d: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" }),
+      e("polyline", { points: "14 2 14 8 20 8" }),
+      e("line", { x1: 12, y1: 9, x2: 12, y2: 13 }),
+      e("line", { x1: 12, y1: 17, x2: 12.01, y2: 17 })
+    );
+    case "chat": return e("svg", p,
+      e("path", { d: "M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" })
+    );
+    case "send": return e("svg", p, e("line", { x1: 22, y1: 2, x2: 11, y2: 13 }), e("polygon", { points: "22 2 15 22 11 13 2 9 22 2" }));
+    case "refresh": return e("svg", p,
+      e("polyline", { points: "23 4 23 10 17 10" }),
+      e("polyline", { points: "1 20 1 14 7 14" }),
+      e("path", { d: "M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" })
+    );
+    case "undo": return e("svg", p,
+      e("path", { d: "M3 10h10a5 5 0 0 1 0 10h-3" }),
+      e("polyline", { points: "7 5 3 10 7 15" })
+    );
+    case "x": return e("svg", p,
+      e("line", { x1: 18, y1: 6, x2: 6, y2: 18 }),
+      e("line", { x1: 6, y1: 6, x2: 18, y2: 18 })
+    );
+    default: return null;
+  }
+}
+
+// ————————————————————————————————————————————————————————
+// Dates — journée d'exploitation, cutoff 6h du matin
+// ————————————————————————————————————————————————————————
+const CUTOFF_HOUR = 6;
+function pad2(n) { return String(n).padStart(2, "0"); }
+function isoDate(y, m, d) { return `${y}-${pad2(m)}-${pad2(d)}`; }
+function businessDateFromParts(year, month, day, hour) {
+  if (hour < CUTOFF_HOUR) {
+    const d = new Date(Date.UTC(year, month - 1, day));
+    d.setUTCDate(d.getUTCDate() - 1);
+    return isoDate(d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate());
+  }
+  return isoDate(year, month, day);
+}
+function addDaysIso(iso, n) {
+  const [y, m, d] = iso.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + n);
+  return isoDate(dt.getUTCFullYear(), dt.getUTCMonth() + 1, dt.getUTCDate());
+}
+function todayIso() {
+  const now = new Date();
+  return isoDate(now.getFullYear(), now.getMonth() + 1, now.getDate());
+}
+function frDate(iso) { const [, m, d] = iso.split("-"); return `${d}/${m}`; }
+
+// ————————————————————————————————————————————————————————
+// Parsing Lightspeed (export détaillé par paiement)
+// Règles verrouillées : encodage latin-1, séparateur ';', quotechar '"'.
+// Net par méthode = somme(Amount) sur Type ∈ {PAYMENT, VOID}.
+// Exclure TRANSITORY_CLOSE, TRANSITORY_COMP, TRANSFER.
+// ————————————————————————————————————————————————————————
+const LS_INCLUDED_TYPES = new Set(["PAYMENT", "VOID"]);
+const LS_EXCLUDED_TYPES = new Set(["TRANSITORY_CLOSE", "TRANSITORY_COMP", "TRANSFER"]);
+
+function normalizeMethod(raw) {
+  if (!raw) return null;
+  const base = raw.split("(")[0].trim().toLowerCase();
+  if (base === "espèces" || base === "especes") return "Espèces";
+  if (base === "carte bleue") return "Carte bleue";
+  if (base === "qr code") return "QR Code";
+  return null;
+}
+function parseLightspeedDate(raw) {
+  const m = /^(\d{2})\/(\d{2})\/(\d{2})\s+(\d{2}):(\d{2})$/.exec((raw || "").trim());
+  if (!m) return null;
+  const [, dd, mm, yy, HH, MM] = m;
+  return { year: 2000 + Number(yy), month: Number(mm), day: Number(dd), hour: Number(HH), minute: Number(MM) };
+}
+function extractTableNumber(accountName) {
+  if (!accountName) return null;
+  const m = /Table\s+(\S+)/i.exec(accountName);
+  return m ? m[1] : null;
+}
+// Parse complet : agrégats jour/méthode (pour les écarts globaux) + liste des
+// transactions individuelles nettées (pour la réconciliation par table).
+// Nettage : une ligne VOID annule la ligne PAYMENT dont l'Identifier == son
+// Reference — les deux sont alors exclues de la liste des transactions
+// actives (seul l'effet net sur les totaux jour/méthode les inclut déjà).
+function parseLightspeedBuffer(arrayBuffer) {
+  const text = new TextDecoder("iso-8859-1").decode(arrayBuffer);
+  const parsed = Papa.parse(text, { header: true, delimiter: ";", quoteChar: '"', skipEmptyLines: true });
+  const days = {};
+  const excludedTypeCounts = {};
+  const unmappedMethods = new Set();
+  const byIdentifier = {};
+  for (const row of parsed.data) {
+    const type = (row.Type || "").trim();
+    if (LS_EXCLUDED_TYPES.has(type)) { excludedTypeCounts[type] = (excludedTypeCounts[type] || 0) + 1; continue; }
+    if (!LS_INCLUDED_TYPES.has(type)) { if (type) excludedTypeCounts[`UNKNOWN:${type}`] = (excludedTypeCounts[`UNKNOWN:${type}`] || 0) + 1; continue; }
+    const dp = parseLightspeedDate(row.Date);
+    if (!dp) continue;
+    const bdate = businessDateFromParts(dp.year, dp.month, dp.day, dp.hour);
+    const amount = parseFloat(row.Amount);
+    if (Number.isNaN(amount)) continue;
+    const method = normalizeMethod(row.Method);
+    if (!method) { if (row.Method) unmappedMethods.add(row.Method); continue; }
+    if (!days[bdate]) days[bdate] = { caEsp: 0, caCB: 0, caQR: 0 };
+    if (method === "Espèces") days[bdate].caEsp += amount;
+    else if (method === "Carte bleue") days[bdate].caCB += amount;
+    else if (method === "QR Code") days[bdate].caQR += amount;
+
+    const time = `${pad2(dp.hour)}:${pad2(dp.minute)}`;
+    const table = extractTableNumber(row.AccountName);
+    if (type === "PAYMENT") {
+      byIdentifier[row.Identifier] = { bdate, time, table, staff: row.Staff || "", method, amount, voided: false };
+    } else if (type === "VOID") {
+      const orig = byIdentifier[row.Reference];
+      if (orig) orig.voided = true;
+    }
+  }
+  const transactions = Object.values(byIdentifier).filter(t => !t.voided);
+  return { days, stats: { excludedTypeCounts, unmappedMethods: Array.from(unmappedMethods) }, transactions };
+}
+
+// ————————————————————————————————————————————————————————
+// Parsing Sunday (format documenté : id, Méthode, Heure, Pourboires,
+// Sous-total, Total, Statut, Serveur, Source) + parseur de secours
+// (format CHECKOUT/NEPTING : provider/sales/tips/processed at/origin)
+// ————————————————————————————————————————————————————————
+function toFloat(raw) { const v = parseFloat((raw || "0").replace(",", ".")); return Number.isNaN(v) ? 0 : v; }
+function parseSundayDate(raw) {
+  const m = /^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})$/.exec((raw || "").trim());
+  if (!m) return null;
+  const [, dd, mm, yyyy, HH, MM] = m;
+  return { year: Number(yyyy), month: Number(mm), day: Number(dd), hour: Number(HH), minute: Number(MM) };
+}
+function decodeUtf8Sig(arrayBuffer) {
+  let text = new TextDecoder("utf-8").decode(arrayBuffer);
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  return text;
+}
+function parseSundayBuffer(arrayBuffer) {
+  const text = decodeUtf8Sig(arrayBuffer);
+  const parsed = Papa.parse(text, { header: true, delimiter: ",", quoteChar: '"', skipEmptyLines: true });
+  const days = {};
+  const statutCounts = {};
+  const sourceCounts = {};
+  const transactions = [];
+  for (const row of parsed.data) {
+    const statut = (row.Statut || "").trim();
+    statutCounts[statut] = (statutCounts[statut] || 0) + 1;
+    if (statut !== "Réussi") continue;
+    const dp = parseSundayDate(row.Heure);
+    if (!dp) continue;
+    const bdate = businessDateFromParts(dp.year, dp.month, dp.day, dp.hour);
+    const sousTotal = toFloat(row["Sous-total"]);
+    const pourboire = toFloat(row["Pourboires"]);
+    const source = (row.Source || "").trim().toLowerCase();
+    sourceCounts[source] = (sourceCounts[source] || 0) + 1;
+    if (!days[bdate]) days[bdate] = { sunCB: 0, sunQR: 0, pbCB: 0, pbQR: 0 };
+    const time = `${pad2(dp.hour)}:${pad2(dp.minute)}`;
+    const table = (row.id || "").trim() || null;
+    if (source === "pay-at-table") {
+      days[bdate].sunQR += sousTotal; days[bdate].pbQR += pourboire;
+      transactions.push({ bdate, time, table, method: "QR Code", amount: sousTotal, serveur: row.Serveur || "" });
+    } else if (source === "pdq") {
+      days[bdate].sunCB += sousTotal; days[bdate].pbCB += pourboire;
+      transactions.push({ bdate, time, table, method: "Carte bleue", amount: sousTotal, serveur: row.Serveur || "" });
+    }
+  }
+  return { days, stats: { statutCounts, sourceCounts }, transactions };
+}
+function parseIsoDatetime(raw) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec((raw || "").trim());
+  if (!m) return null;
+  const [, yyyy, mm, dd, HH] = m;
+  return { year: Number(yyyy), month: Number(mm), day: Number(dd), hour: Number(HH) };
+}
+function parseSundayCheckoutBuffer(arrayBuffer) {
+  const text = decodeUtf8Sig(arrayBuffer);
+  const parsed = Papa.parse(text, { header: true, delimiter: ",", quoteChar: '"', skipEmptyLines: true });
+  const days = {};
+  for (const row of parsed.data) {
+    const dp = parseIsoDatetime(row["processed at"]);
+    if (!dp) continue;
+    const bdate = businessDateFromParts(dp.year, dp.month, dp.day, dp.hour);
+    const sales = toFloat(row.sales);
+    const tips = toFloat(row.tips);
+    const origin = (row.origin || "").trim().toUpperCase();
+    if (!days[bdate]) days[bdate] = { sunCB: 0, sunQR: 0, pbCB: 0, pbQR: 0 };
+    if (origin === "PAT") { days[bdate].sunQR += sales; days[bdate].pbQR += tips; }
+    else if (origin === "PDQ") { days[bdate].sunCB += sales; days[bdate].pbCB += tips; }
+  }
+  return { days };
+}
+
+// Export Skello (.xlsx, un fichier par semaine). Colonnes utiles : "Nom",
+// "Prénom", "Matricule de paie", "Heures Travaillées (h)" — les nombres
+// peuvent arriver en virgule française ("87,48") si la cellule est du texte,
+// ou déjà en nombre si Excel/Skello a bien typé la colonne.
+function parseSkelloNumber(v) {
+  if (typeof v === "number") return v;
+  if (typeof v !== "string") return 0;
+  const n = parseFloat(v.trim().replace(",", "."));
+  return isNaN(n) ? 0 : n;
+}
+function parseSkelloBuffer(arrayBuffer) {
+  const wb = XLSX.read(arrayBuffer, { type: "array" });
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  const grid = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+  if (!grid.length) return [];
+  // Skello ajoute 2 lignes avant les vrais en-têtes : un titre ("CONTRATS
+  // STANDARDS") puis une ligne de catégories ("Données Contractuelles",
+  // "Heures Planning Période"...). On cherche donc la ligne qui contient
+  // réellement "Matricule de paie" plutôt que de supposer que c'est la
+  // toute première ligne du fichier.
+  let headerRowIdx = grid.findIndex(row => row.some(c => String(c || "").trim() === "Matricule de paie"));
+  if (headerRowIdx === -1) headerRowIdx = 0;
+  const header = grid[headerRowIdx].map(h => String(h || "").trim());
+  const idxNom       = header.indexOf("Nom");
+  const idxPrenom     = header.indexOf("Prénom");
+  const idxMatricule = header.indexOf("Matricule de paie");
+  const idxHeures     = header.findIndex(h => h.startsWith("Heures Travaillées"));
+  if (idxMatricule === -1 || idxHeures === -1) {
+    throw new Error('colonnes "Matricule de paie" / "Heures Travaillées (h)" introuvables — format Skello inattendu');
+  }
+  const employes = [];
+  for (let i = headerRowIdx + 1; i < grid.length; i++) {
+    const row = grid[i];
+    const matricule = String(row[idxMatricule] || "").trim();
+    // "-" = pas de matricule de paie renseigné pour cet employé (ex.
+    // contrat en cours de création) — on l'ignore, comme une case vide.
+    if (!matricule || matricule === "-") continue;
+    employes.push({
+      matricule,
+      nom: String(row[idxNom] || "").trim(),
+      prenom: String(row[idxPrenom] || "").trim(),
+      heures: parseSkelloNumber(row[idxHeures]),
+    });
+  }
+  return employes;
+}
+
+function round2(n) { return Math.round((n + Number.EPSILON) * 100) / 100; }
+function extractLsDays(rows) { const out = {}; rows.forEach(r => out[r.date] = { caEsp: r.caEsp, caCB: r.caCB, caQR: r.caQR }); return out; }
+function extractSunDays(rows) { const out = {}; rows.forEach(r => out[r.date] = { sunCB: r.sunCB, sunQR: r.sunQR, pbCB: r.pbCB, pbQR: 0 }); return out; }
+function mergeDaysToRows(lsDays, sunDays, existingRows = []) {
+  const existingByDate = Object.fromEntries(existingRows.map(r => [r.date, r]));
+  const allDates = new Set([...Object.keys(lsDays), ...Object.keys(sunDays), ...Object.keys(existingByDate)]);
+  return Array.from(allDates).sort().map(date => {
+    const ls = lsDays[date] || { caEsp: 0, caCB: 0, caQR: 0 };
+    const sun = sunDays[date] || { sunCB: 0, sunQR: 0, pbCB: 0, pbQR: 0 };
+    const prev = existingByDate[date] || {};
+    return {
+      date,
+      caEsp: round2(ls.caEsp), caCB: round2(ls.caCB), caQR: round2(ls.caQR),
+      sunCB: round2(sun.sunCB), sunQR: round2(sun.sunQR), pbCB: round2(sun.pbCB),
+      depenses: prev.depenses ?? 0, especesComptees: prev.especesComptees ?? 0,
+      pbEspDirect: prev.pbEspDirect ?? 0, fonds: prev.fonds ?? 0,
+      // Sourcées en lecture seule depuis le Sheet caisse.grupodomingo.io :
+      ouverture: prev.ouverture ?? 0, misesCoffre: prev.misesCoffre ?? 0, ecartCaisse: prev.ecartCaisse ?? 0,
+      fondsTheorique: prev.fondsTheorique ?? 0,
+    };
+  });
+}
+
+// Fusionne les données lues sur le Sheet caisse.grupodomingo.io (fond de
+// caisse, pourboires directs, mises au coffre, écart de caisse) dans les
+// lignes Journalier existantes, par date. N'écrase rien côté Lightspeed/Sunday.
+function mergeFondCaisse(rows, fondCaisseByDate) {
+  return rows.map(r => {
+    const fc = fondCaisseByDate[r.date];
+    if (!fc) return r;
+    // Fonds de caisse théorique recalculé côté client (plutôt que de
+    // reprendre tel quel la colonne "Nouveau fonds théorique" de Clôtures,
+    // qui — sur une journée à 2 services — ne reflète que le dernier
+    // service) : ouverture du jour + CA espèces − dépannage − mises au
+    // coffre, cumulés sur la journée entière.
+    const fondsTheorique = round2((fc.ouverture || 0) + (fc.ventesEspeces || 0) - (fc.depannage || 0) - (fc.misesCoffre || 0));
+    return {
+      ...r,
+      depenses: fc.depannage,
+      especesComptees: fc.especesComptees,
+      fonds: fc.especesComptees, // fond gardé pour le lendemain
+      pbEspDirect: fc.pourboires,
+      ouverture: fc.ouverture,
+      misesCoffre: fc.misesCoffre,
+      ecartCaisse: fc.ecartCaisse,
+      fondsTheorique,
+    };
+  });
+}
+
+const SEUIL = 5;
+const HISTORIQUE_DEBUT = "2026-04-03"; // pas d'affichage de jours vides avant cette date
+const euro = (n) => `${n < 0 ? "-" : ""}${Math.abs(n).toLocaleString("fr-FR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €`;
+// Les montants de pourboires (cagnotte, part par employé) s'affichent arrondis
+// à l'unité — pas de centimes — sur demande de Théo. Le calcul interne garde
+// 2 décimales (round2) pour que la somme des parts ne dérive pas ; seul
+// l'affichage est arrondi.
+const euro0 = (n) => `${Math.round(n).toLocaleString("fr-FR")} €`;
+// Dernier versement de pourboires avant la mise en place de cette app —
+// montant donné directement par Théo (2026-07-08). Détail par employé
+// reconstitué à partir de l'export Skello (heures cumulées mai→juillet,
+// donné en dur le 2026-07-10), réparti au pro rata des heures comme le fait
+// le calcul en direct — le total des parts arrondies (674,98€) peut différer
+// de quelques centimes du montant réel versé (675€, valeur de référence).
+// Sert aussi de point de départ par défaut pour le calcul de la cagnotte
+// tant qu'aucun versement n'a encore été validé dans l'app.
+const REPARTITION_HISTORIQUE = {
+  dateRepartition: "2026-07-06",
+  periodeDebut: "2026-05-25",
+  periodeFin: "2026-07-05",
+  montant: 675,
+  employes: [
+    { nom: "ALVES DE BRITO", prenom: "Thomas", heures: 38.5, montant: 4.47 },
+    { nom: "AUBER-YVARS", prenom: "Sarah", heures: 197.58, montant: 22.94 },
+    { nom: "AZORSA CASTRO", prenom: "Angel Hildebrando", heures: 155.15, montant: 18.02 },
+    { nom: "BAKER", prenom: "Claude", heures: 245.4, montant: 28.50 },
+    { nom: "BENOÎT", prenom: "Léa", heures: 141.12, montant: 16.39 },
+    { nom: "BISPO", prenom: "Patrick", heures: 271.82, montant: 31.56 },
+    { nom: "BURKOVSKIY", prenom: "Nikita", heures: 45.23, montant: 5.25 },
+    { nom: "BURSZTYN", prenom: "Oscar", heures: 90.8, montant: 10.54 },
+    { nom: "CHOTALIYA", prenom: "Jinesh", heures: 273.43, montant: 31.75 },
+    { nom: "DELRUE", prenom: "Adrien", heures: 211, montant: 24.50 },
+    { nom: "DERQUE", prenom: "Gaëlle", heures: 0, montant: 0 },
+    { nom: "DE FARIA", prenom: "Luna", heures: 110.18, montant: 12.79 },
+    { nom: "DE LA CALLE SANFIZ", prenom: "Alejandro", heures: 278.22, montant: 32.31 },
+    { nom: "FITZPATRICK", prenom: "Noah", heures: 134.3, montant: 15.59 },
+    { nom: "GOMEZ", prenom: "Aïnhoa", heures: 17.25, montant: 2.00 },
+    { nom: "GOÑI MARTINEZ", prenom: "José Maria", heures: 287.25, montant: 33.35 },
+    { nom: "HOMEZ", prenom: "Daniel", heures: 0, montant: 0 },
+    { nom: "HORVÁTH", prenom: "Bence", heures: 212.12, montant: 24.63 },
+    { nom: "JAYARAMU", prenom: "Maju", heures: 277.17, montant: 32.18 },
+    { nom: "LEGENDRE", prenom: "Coralie", heures: 117.8, montant: 13.68 },
+    { nom: "LE GALL", prenom: "Simon", heures: 34.45, montant: 4.00 },
+    { nom: "LE GALL", prenom: "Simon", heures: 194.77, montant: 22.62 },
+    { nom: "MARQUEZ", prenom: "Richard", heures: 143.63, montant: 16.68 },
+    { nom: "MARTINEZ", prenom: "Sofia", heures: 240.4, montant: 27.91 },
+    { nom: "MARTIN FYNE", prenom: "César", heures: 38.43, montant: 4.46 },
+    { nom: "MBORIFUKO", prenom: "Edmond", heures: 253.45, montant: 29.43 },
+    { nom: "MEAURIO", prenom: "Gustavo", heures: 119.8, montant: 13.91 },
+    { nom: "MORERA IBARRIA", prenom: "Ivan", heures: 161.18, montant: 18.72 },
+    { nom: "MSIEGO MONTERO", prenom: "Elena", heures: 215.75, montant: 25.05 },
+    { nom: "NITLICH", prenom: "Béla-Blue", heures: 60.88, montant: 7.07 },
+    { nom: "NOBLECILLA MORAN", prenom: "Alicia Fernanda", heures: 233.75, montant: 27.14 },
+    { nom: "PALACIOS REY", prenom: "Agostina", heures: 188.2, montant: 21.85 },
+    { nom: "RODRÍGUEZ AVALOS", prenom: "María Fernanda", heures: 48.28, montant: 5.61 },
+    { nom: "ROSSIGNOL", prenom: "Chloé", heures: 54.87, montant: 6.37 },
+    { nom: "SUAREZ SILVA SANTISTEBAN", prenom: "Ariana", heures: 196.1, montant: 22.77 },
+    { nom: "TAGMOUNT", prenom: "Solène", heures: 68.55, montant: 7.96 },
+    { nom: "TOGGWYLER", prenom: "Apolline", heures: 152.17, montant: 17.67 },
+    { nom: "VIG", prenom: "Leah", heures: 26.75, montant: 3.11 },
+    { nom: "VILLA VALEIRO", prenom: "Victor", heures: 277.33, montant: 32.20 },
+  ],
+};
+
+// ————————————————————————————————————————————————————————
+// Réconciliation par table : pour QR Code (seule méthode où Sunday connaît
+// la table, via pay-at-table), on SOMME tous les paiements Lightspeed et
+// tous les paiements Sunday d'une table sur la journée, puis on compare les
+// deux totaux. Volontairement PAS d'appariement ligne à ligne : une même
+// table peut être payée en plusieurs fois différemment d'un système à
+// l'autre (addition scindée autrement, règlement partiel...) sans que ça
+// soit une anomalie — seul un écart sur la SOMME du jour compte.
+// Carte bleue (pdq) n'a pas de numéro de table côté Sunday : pas de
+// réconciliation par table possible pour cette méthode, seul le total
+// global (déjà dans "Dépôt en cours") est pertinent.
+// ————————————————————————————————————————————————————————
+function reconcileTableAmounts(lsTransactions, sunTransactions) {
+  const byDay = {}; // bdate -> table -> { lsTotal, sunTotal }
+  const add = (t, key) => {
+    byDay[t.bdate] = byDay[t.bdate] || {};
+    const table = t.table || "?";
+    byDay[t.bdate][table] = byDay[t.bdate][table] || { lsTotal: 0, sunTotal: 0 };
+    byDay[t.bdate][table][key] += t.amount;
+  };
+  lsTransactions.forEach(t => { if (t.method === "QR Code") add(t, "lsTotal"); });
+  sunTransactions.forEach(t => { if (t.method === "QR Code") add(t, "sunTotal"); });
+  return byDay;
+}
+
+// ————————————————————————————————————————————————————————
+// Sous-composants
+// ————————————————————————————————————————————————————————
+function ReconCard({ icon, title, a, b, ecart, ok, note }) {
+  return e("div", { style: { ...S.card, borderTop: `3px solid ${ok ? "#3a7d5c" : "#c25b3a"}` } },
+    e("div", { style: S.cardHead },
+      e("div", { style: { display: "flex", alignItems: "center", gap: 8, color: "#5a4d40" } }, icon, e("b", null, title)),
+      e("div", { style: { ...S.badge, background: ok ? "#e6f4ec" : "#fbeae2", color: ok ? "#2e6a4a" : "#b04a26" } }, e(Icon, { name: ok ? "check" : "alert", size: 13 }))
+    ),
+    e("div", { style: S.cardRow }, e("span", null, a.label), e("b", null, euro(a.val))),
+    e("div", { style: S.cardRow }, e("span", null, b.label), e("b", null, euro(b.val))),
+    e("div", { style: S.ecartBox },
+      e("span", { style: { fontSize: 12, color: "#8a7d70" } }, "ÉCART"),
+      e("span", { style: { fontSize: 22, fontWeight: 800, color: ok ? "#3a7d5c" : "#c25b3a" } }, euro(ecart))
+    ),
+    e("div", { style: S.note }, note)
+  );
+}
+function LineCalc({ label, val, bold, muted }) {
+  return e("div", { style: { ...S.lineCalc, fontWeight: bold ? 700 : 400, color: muted ? "#a89b8d" : "#3a332c" } },
+    e("span", null, label), e("span", null, euro(val))
+  );
+}
+
+// ————————————————————————————————————————————————————————
+// Assistant Claude — bulle flottante, disponible sur tous les onglets.
+// Le contexte (détail jour par jour, écarts par table, totaux) est passé en
+// prop et recalculé par le parent à chaque changement de fenêtre.
+// ————————————————————————————————————————————————————————
+function AssistantBubble({ context, disabled }) {
+  const [open, setOpen] = useState(false);
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [elapsed, setElapsed] = useState(0); // secondes écoulées depuis l'envoi — pour ne pas donner l'impression d'être figé
+
+  const send = async () => {
+    const question = input.trim();
+    if (!question || loading) return;
+    setInput("");
+    const nextMessages = [...messages, { role: "user", content: question }];
+    setMessages(nextMessages);
+    setLoading(true);
+    setElapsed(0);
+    const timer = setInterval(() => setElapsed(s => s + 1), 1000);
+    try {
+      const answer = await askClaudeRequest(question, context, messages);
+      setMessages(m => [...m, { role: "assistant", content: answer }]);
+    } catch (err) {
+      setMessages(m => [...m, { role: "assistant", content: "Erreur : impossible de contacter l'assistant." }]);
+    } finally {
+      clearInterval(timer);
+      setLoading(false);
+    }
+  };
+
+  if (!open) {
+    return e("button", { style: S.assistantFab, onClick: () => setOpen(true), title: "Assistant Rosario" },
+      e(Icon, { name: "chat", size: 22, color: "#fff" })
+    );
+  }
+
+  return e("div", { style: S.assistantPanel },
+    e("div", { style: S.assistantHeader },
+      e("div", { style: { display: "flex", alignItems: "center", gap: 8 } }, e(Icon, { name: "chat", size: 16 }), e("span", null, "Assistant Rosario")),
+      e("button", { style: S.assistantClose, onClick: () => setOpen(false) }, "✕")
+    ),
+    e("div", { style: S.assistantMessages },
+      messages.length === 0 ? e("div", { style: S.assistantHint },
+        "Pose une question sur un écart, une table, un jour précis — je vois ce qui est affiché dans la fenêtre en cours."
+      ) : null,
+      messages.map((m, i) => e("div", { key: i, style: { ...S.assistantMsg, ...(m.role === "user" ? S.assistantMsgUser : S.assistantMsgBot) } }, m.content)),
+      loading ? e("div", { style: { ...S.assistantMsg, ...S.assistantMsgBot, fontStyle: "italic", color: "#a89b8d" } },
+        elapsed > 0 ? `… (${Math.round(elapsed)}s, jusqu'à 30s)` : "…"
+      ) : null
+    ),
+    e("div", { style: S.assistantInputRow },
+      e("input", {
+        style: S.assistantInput, value: input, placeholder: disabled ? "Importe des données d'abord" : "Ta question…",
+        disabled: loading, onChange: ev => setInput(ev.target.value),
+        onKeyDown: ev => { if (ev.key === "Enter") send(); },
+      }),
+      e("button", { style: S.assistantSend, onClick: send, disabled: loading || !input.trim() }, e(Icon, { name: "send", size: 15, color: "#fff" }))
+    )
+  );
+}
+
+// ————————————————————————————————————————————————————————
+// App
+// ————————————————————————————————————————————————————————
+function App() {
+  const [rows, setRows] = useState([]);
+  const [tab, setTab] = useState("courant");
+  const [edit, setEdit] = useState(null);
+  const [lsFileName, setLsFileName] = useState(null);
+  const [sunFileName, setSunFileName] = useState(null);
+  const [importWarnings, setImportWarnings] = useState([]);
+  const [debutCycle, setDebutCycle] = useState(null);
+  const [finCycle, setFinCycle] = useState(null);
+  const [lsTransactions, setLsTransactions] = useState([]);
+  const [sunTransactions, setSunTransactions] = useState([]);
+  const [depots, setDepots] = useState([]);
+  const [repartitions, setRepartitions] = useState([]);
+  const [employesHeures, setEmployesHeures] = useState({}); // matricule -> {nom, prenom, heures}
+  const [skelloFileNames, setSkelloFileNames] = useState([]);
+  const [expandedRepartition, setExpandedRepartition] = useState(null); // dateRepartition dépliée dans l'historique pourboires
+  const [sheetStatus, setSheetStatus] = useState(SCRIPT_URL ? "loading" : "off");
+
+  const AUJOURDHUI = todayIso();
+  const earliestRowDate = rows.length ? rows.reduce((min, r) => (r.date < min ? r.date : min), rows[0].date) : null;
+  // Par défaut, la borne basse de la fenêtre à réconcilier = la date du
+  // dernier dépôt validé (pas depuis le tout début de l'historique) — sinon,
+  // à chaque rechargement de page, la fenêtre "à réconcilier" ré-engloberait
+  // tout l'historique déjà déposé, ce qui rend la page illisible sans
+  // reconfigurer manuellement la date de début à chaque fois.
+  const dernierDepot = depots.length
+    ? depots.reduce((max, d) => (d.dateDepot > max.dateDepot ? d : max), depots[0])
+    : null;
+  const debutFenetreDefaut = dernierDepot ? dernierDepot.dateDepot : earliestRowDate;
+  const debutFenetre = debutCycle || debutFenetreDefaut;
+  // Fin de fenêtre : hier par défaut (aujourd'hui est toujours "en cours",
+  // donc exclu), mais ajustable manuellement pour analyser une période
+  // passée sans attendre la fin de la journée.
+  const finFenetreDefaut = addDaysIso(AUJOURDHUI, -1);
+  const finFenetre = finCycle || finFenetreDefaut;
+
+  const [fondCaisse, setFondCaisse] = useState({});
+  const [reloadTick, setReloadTick] = useState(0);
+  // Bouton "Rafraîchir" — force un re-fetch complet du Sheet (utile après une
+  // erreur réseau/déploiement, ou pour resynchroniser sans recharger la page).
+  const reloadFromSheet = () => setReloadTick(t => t + 1);
+
+  useEffect(() => {
+    if (!SCRIPT_URL) return;
+    let cancelled = false;
+    setSheetStatus("loading");
+    (async () => {
+      const [jRows, dRows, fcRows, rRows] = await Promise.all([fetchJournalier(), fetchDepots(), fetchFondCaisse(), fetchRepartitions()]);
+      if (cancelled) return;
+      setFondCaisse(fcRows);
+      // Premier chargement (rows encore vide) : on prend telles quelles les
+      // données du Sheet. Rechargement manuel/ultérieur : on re-synchronise
+      // toujours avec le Sheet (source de vérité), au cas où d'autres jours
+      // auraient été ajoutés depuis (clôtures, imports) entre-temps.
+      if (jRows.length) setRows(prev => (prev.length && reloadTick === 0 ? prev : mergeFondCaisse(jRows, fcRows)));
+      setDepots(dRows);
+      setRepartitions(rRows);
+      setSheetStatus("ok");
+    })().catch(() => { if (!cancelled) setSheetStatus("error"); });
+    return () => { cancelled = true; };
+  }, [reloadTick]);
+
+  // Dès que le fond de caisse (caisse.grupodomingo.io) est chargé/rafraîchi,
+  // on l'applique aux lignes déjà présentes (import CSV fait avant la fin du
+  // chargement du Sheet, par ex.).
+  useEffect(() => {
+    if (Object.keys(fondCaisse).length === 0) return;
+    setRows(prev => mergeFondCaisse(prev, fondCaisse));
+  }, [fondCaisse]);
+
+  const handleFile = useCallback((file, kind) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const buf = reader.result;
+        if (kind === "lightspeed") {
+          const { days, stats, transactions } = parseLightspeedBuffer(buf);
+          setLsFileName(file.name);
+          setRows(prev => {
+            const merged = mergeDaysToRows(days, extractSunDays(prev), prev);
+            importJournalierBulk(merged);
+            return merged;
+          });
+          setLsTransactions(transactions);
+          if (Object.keys(stats.excludedTypeCounts).some(k => k.startsWith("UNKNOWN"))) {
+            setImportWarnings(w => [...w, `Lightspeed : type(s) de transaction inconnu(s) — vérifier ${file.name}.`]);
+          }
+          if (stats.unmappedMethods.length) {
+            setImportWarnings(w => [...w, `Lightspeed : méthode(s) non reconnue(s) : ${stats.unmappedMethods.join(", ")}.`]);
+          }
+        } else {
+          let result;
+          try {
+            result = parseSundayBuffer(buf);
+            if (Object.keys(result.stats.sourceCounts).length === 0) throw new Error("format inattendu");
+          } catch (err) {
+            result = { days: parseSundayCheckoutBuffer(buf).days, transactions: [] };
+            setImportWarnings(w => [...w, `Sunday : format "documenté" non détecté dans ${file.name}, bascule sur le parseur de secours (CHECKOUT). À vérifier (pas de réconciliation par table possible avec ce format, il manque le numéro de table).`]);
+          }
+          setSunFileName(file.name);
+          setRows(prev => {
+            const merged = mergeDaysToRows(extractLsDays(prev), result.days, prev);
+            importJournalierBulk(merged);
+            return merged;
+          });
+          setSunTransactions(result.transactions || []);
+        }
+      } catch (err) {
+        setImportWarnings(w => [...w, `Erreur de lecture de ${file.name} : ${err.message}`]);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  }, []);
+
+  // Import Skello (.xlsx, un fichier par semaine) : chaque fichier ajouté
+  // vient s'additionner aux heures déjà cumulées pour la période en cours
+  // (on peut importer les fichiers un par un ou tous d'un coup).
+  const handleSkelloFile = useCallback((file) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const employes = parseSkelloBuffer(reader.result);
+        setEmployesHeures(prev => {
+          const next = { ...prev };
+          employes.forEach(emp => {
+            const existing = next[emp.matricule];
+            next[emp.matricule] = {
+              nom: emp.nom || (existing && existing.nom) || "",
+              prenom: emp.prenom || (existing && existing.prenom) || "",
+              heures: round2((existing ? existing.heures : 0) + emp.heures),
+            };
+          });
+          return next;
+        });
+        setSkelloFileNames(names => [...names, file.name]);
+      } catch (err) {
+        setImportWarnings(w => [...w, `Skello : erreur de lecture de ${file.name} — ${err.message}`]);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  }, []);
+  const resetSkelloImport = useCallback(() => {
+    setEmployesHeures({});
+    setSkelloFileNames([]);
+  }, []);
+
+  const fenetre = useMemo(() => {
+    if (!debutFenetre) return [];
+    return rows.filter(r => r.date >= debutFenetre && r.date <= finFenetre);
+  }, [rows, debutFenetre, finFenetre]);
+
+  // Depuis le Sheet caisse.grupodomingo.io : Écart de caisse (fermeture
+  // réelle − fermeture théorique du jour) positif = pourboires trouvés dans
+  // le tiroir, négatif = manquant réel. Le dépôt réel de la semaine, c'est
+  // la somme de ce qui a été physiquement mis au coffre chaque jour — le
+  // calcul théorique Lightspeed sert seulement de vérification à côté.
+  const agg = useMemo(() => {
+    const sum = k => fenetre.reduce((s, r) => s + (r[k] || 0), 0);
+    const caEsp = sum("caEsp"), depenses = sum("depenses");
+    const lsCB = sum("caCB"), sunCB = sum("sunCB"), lsQR = sum("caQR"), sunQR = sum("sunQR");
+    const pbCB = sum("pbCB"), pbEspDirect = sum("pbEspDirect");
+    const misesCoffreTotal = sum("misesCoffre"); // espèces réellement collectées (mises au coffre)
+    const veille = debutFenetre ? addDaysIso(debutFenetre, -1) : null;
+    const rowFondsDebut = rows.find(r => r.date === veille);
+    const rowFondsFin = fenetre.length ? fenetre[fenetre.length - 1] : null;
+    const fondsDebut = rowFondsDebut ? rowFondsDebut.fonds : 0;
+    const fondsFin = rowFondsFin ? rowFondsFin.fonds : 0;
+    const deltaFonds = fondsFin - fondsDebut; // Δ fonds de caisse (fin − début de la fenêtre)
+    const depotTheorique = caEsp - depenses - deltaFonds; // CA espèces − dépenses − Δ fonds de caisse
+    const depotReel = Math.floor(depotTheorique / 10) * 10; // arrondi à la dizaine inférieure — montant à déposer
+    const ecartCaisseNet = misesCoffreTotal - depotTheorique; // pourboires (>0) ou manquants (<0)
+    const pbCaisse = ecartCaisseNet > 0 ? ecartCaisseNet : 0;
+    const manquants = ecartCaisseNet < 0 ? ecartCaisseNet : 0;
+    // Reste en caisse pour absorber l'arrondi à la dizaine inférieure du
+    // dépôt — 3e "poche" avec dépôt banque + pourboires caisse, qui doit
+    // reboucler exactement sur les espèces collectées (cf. carte "Répartition").
+    const fondsParallele = round2(depotTheorique - depotReel);
+    return {
+      caEsp, depenses, fondsDebut, fondsFin, deltaFonds, lsCB, sunCB, lsQR, sunQR, pbCB, pbEspDirect, misesCoffreTotal,
+      pbCaisse, manquants, ecartCaisseNet, depotTheorique, depotReel, fondsParallele,
+      ecartCB: lsCB - sunCB, ecartQR: lsQR - sunQR,
+      okCB: Math.abs(lsCB - sunCB) <= SEUIL, okQR: Math.abs(lsQR - sunQR) <= SEUIL,
+      okEsp: Math.abs(ecartCaisseNet) <= 20,
+    };
+  }, [fenetre, rows, debutFenetre]);
+
+  const globalOK = agg.okCB && agg.okQR;
+  const updateCell = (date, champ, val) => setRows(rs => {
+    const existe = rs.some(r => r.date === date);
+    // Un jour affiché comme "vide" (pas encore de ligne côté Sheet, cf.
+    // joursAffiches plus bas) peut être édité directement — on crée la
+    // ligne à la volée plutôt que de perdre la saisie.
+    const newRows = existe
+      ? rs.map(r => r.date === date ? { ...r, [champ]: Number(val) || 0 } : r)
+      : [...rs, {
+          date, caEsp: 0, caCB: 0, caQR: 0, sunCB: 0, sunQR: 0, depenses: 0,
+          especesComptees: 0, pbEspDirect: 0, pbCB: 0, fonds: 0, ouverture: 0, misesCoffre: 0, ecartCaisse: 0, fondsTheorique: 0,
+          [champ]: Number(val) || 0,
+        }].sort((a, b) => a.date.localeCompare(b.date));
+    const updated = newRows.find(r => r.date === date);
+    if (updated) saveJourFireAndForget(updated);
+    return newRows;
+  });
+
+  // Vue "jours" complète : tous les jours calendaires depuis HISTORIQUE_DEBUT
+  // jusqu'à aujourd'hui, y compris ceux sans ligne côté Sheet (affichés à
+  // zéro) — plus récent en premier.
+  const joursAffiches = useMemo(() => {
+    const parDate = Object.fromEntries(rows.map(r => [r.date, r]));
+    const out = [];
+    for (let d = HISTORIQUE_DEBUT; d <= AUJOURDHUI; d = addDaysIso(d, 1)) {
+      out.push(parDate[d] || {
+        date: d, caEsp: 0, caCB: 0, caQR: 0, sunCB: 0, sunQR: 0, depenses: 0,
+        especesComptees: 0, pbEspDirect: 0, pbCB: 0, fonds: 0, ouverture: 0, misesCoffre: 0, ecartCaisse: 0, fondsTheorique: 0,
+      });
+    }
+    return out.reverse();
+  }, [rows, AUJOURDHUI]);
+
+  const handleValiderDepot = async () => {
+    if (!window.confirm(`Valider le dépôt du ${frDate(AUJOURDHUI)} pour ${euro(agg.depotReel)} ? Ça fige la fenêtre ${frDate(debutFenetre)}→${frDate(finFenetre)} dans l'historique.`)) return;
+    const depot = {
+      dateDepot: AUJOURDHUI, periodeDebut: debutFenetre, periodeFin: finFenetre,
+      depotTheorique: agg.depotTheorique, depotReel: agg.depotReel,
+      pbCaisse: agg.pbCaisse, pbEspDirect: agg.pbEspDirect, pbCB: agg.pbCB, manquants: agg.manquants,
+      caEsp: agg.caEsp, depenses: agg.depenses, deltaCaisse: agg.deltaFonds, especesCollectees: agg.misesCoffreTotal,
+    };
+    await validerDepotRequest(depot);
+    setDepots(prev => [...prev, depot]);
+    setDebutCycle(AUJOURDHUI);
+    setFinCycle(null);
+  };
+
+  // Annule le dernier dépôt validé (erreur de saisie) — la fenêtre à
+  // réconcilier reprend automatiquement au dépôt précédent une fois la
+  // ligne supprimée du Sheet.
+  const handleSupprimerDernierDepot = async () => {
+    if (depots.length === 0) return;
+    const dernier = depots.reduce((max, d) => (d.dateDepot > max.dateDepot ? d : max), depots[0]);
+    if (!window.confirm(`Supprimer le dépôt du ${frDate(dernier.dateDepot)} (période ${frDate(dernier.periodeDebut)}→${frDate(dernier.periodeFin)}) ? Cette action est irréversible.`)) return;
+    const res = await supprimerDernierDepotRequest();
+    if (res.status === "ok") {
+      setDepots(prev => prev.filter(d => d.dateDepot !== dernier.dateDepot));
+      if (debutCycle === AUJOURDHUI) setDebutCycle(null); // réaligne la fenêtre par défaut sur le nouveau dernier dépôt
+    } else {
+      alert("Suppression impossible : " + (res.message || "erreur inconnue."));
+    }
+  };
+
+  const tableRecon = useMemo(() => {
+    if (!debutFenetre) return {};
+    const lsIn = lsTransactions.filter(t => t.bdate >= debutFenetre && t.bdate < AUJOURDHUI);
+    const sunIn = sunTransactions.filter(t => t.bdate >= debutFenetre && t.bdate < AUJOURDHUI);
+    return reconcileTableAmounts(lsIn, sunIn);
+  }, [lsTransactions, sunTransactions, debutFenetre, AUJOURDHUI]);
+
+  // Pourboires espèces cumulées JOUR PAR JOUR (données du formulaire de
+  // clôture, colonne "Pourboires" = espèces comptées − fonds théorique,
+  // part positive seulement) depuis le dernier versement — pas depuis les
+  // dépôts validés : la cagnotte se remplit directement au fil des
+  // clôtures, indépendamment du rythme des dépôts en banque.
+  // Borne basse INCLUSE (même règle que les dépôts) : si le dernier
+  // versement a eu lieu le 6, la cagnotte suivante recompte depuis le 6
+  // inclus. Borne haute = hier (j-1), aujourd'hui n'étant jamais clôturé au
+  // moment de la réconciliation.
+  const repartitionCalc = useMemo(() => {
+    const dernierePartitionDate = repartitions.length
+      ? repartitions.reduce((max, r) => (r.dateRepartition > max ? r.dateRepartition : max), repartitions[0].dateRepartition)
+      : REPARTITION_HISTORIQUE.dateRepartition;
+    const finCagnotte = addDaysIso(AUJOURDHUI, -1);
+    const joursInclus = rows.filter(r => r.date >= dernierePartitionDate && r.date <= finCagnotte);
+    const cagnotte = round2(joursInclus.reduce((s, r) => {
+      const jour = round2((r.especesComptees || 0) - (r.fondsTheorique || 0));
+      return s + (jour > 0 ? jour : 0);
+    }, 0));
+    const periodeDebut = dernierePartitionDate;
+    const employesList = Object.entries(employesHeures).map(([matricule, v]) => ({ matricule, ...v }));
+    const totalHeures = round2(employesList.reduce((s, emp) => s + emp.heures, 0));
+    const employesAvecPart = employesList.map(emp => ({
+      ...emp,
+      montant: totalHeures > 0 ? round2(cagnotte * emp.heures / totalHeures) : 0,
+    })).sort((a, b) => (a.nom + a.prenom).localeCompare(b.nom + b.prenom));
+    const totalReparti = round2(employesAvecPart.reduce((s, emp) => s + emp.montant, 0));
+    return { dernierePartitionDate, joursInclus, cagnotte, periodeDebut, periodeFin: finCagnotte, employesAvecPart, totalHeures, totalReparti };
+  }, [repartitions, rows, employesHeures, AUJOURDHUI]);
+
+  const handleValiderRepartition = async () => {
+    const { cagnotte, periodeDebut, periodeFin, employesAvecPart } = repartitionCalc;
+    if (employesAvecPart.length === 0) { window.alert("Importe au moins un fichier Skello avant de valider."); return; }
+    if (!window.confirm(`Valider le versement de ${euro0(cagnotte)} entre ${employesAvecPart.length} employé(s) ? Ça fige la période ${frDate(periodeDebut)}→${frDate(periodeFin)} dans l'historique. La cagnotte repart ensuite de zéro.`)) return;
+    const payload = {
+      dateRepartition: AUJOURDHUI,
+      periodeDebut,
+      periodeFin,
+      employes: employesAvecPart,
+    };
+    await validerRepartitionRequest(payload);
+    setRepartitions(prev => [
+      ...prev,
+      ...employesAvecPart.map(emp => ({ dateRepartition: payload.dateRepartition, periodeDebut: payload.periodeDebut, periodeFin: payload.periodeFin, ...emp })),
+    ]);
+    resetSkelloImport();
+  };
+
+  // Historique des versements groupé par date de versement (un versement =
+  // plusieurs lignes employé partageant la même dateRepartition), pour
+  // l'onglet "Historique" pourboires — + le versement historique en dur
+  // (avant migration vers cette app ; le montant affiché en ligne reste le
+  // montant réel donné par Théo — 675€ — même si la somme des parts par
+  // employé reconstituées au pro rata des heures Skello arrondit à 674,98€).
+  const historiqueRepartitions = useMemo(() => {
+    const parDate = {};
+    repartitions.forEach(r => {
+      if (!parDate[r.dateRepartition]) {
+        parDate[r.dateRepartition] = { dateRepartition: r.dateRepartition, periodeDebut: r.periodeDebut, periodeFin: r.periodeFin, employes: [] };
+      }
+      parDate[r.dateRepartition].employes.push({ nom: r.nom, prenom: r.prenom, heures: r.heures, montant: r.montant });
+    });
+    const groupes = Object.values(parDate).map(g => ({
+      ...g,
+      montant: round2(g.employes.reduce((s, emp) => s + emp.montant, 0)),
+      nbSalaries: g.employes.length,
+      totalHeures: round2(g.employes.reduce((s, emp) => s + emp.heures, 0)),
+      historique: false,
+    }));
+    groupes.push({
+      dateRepartition: REPARTITION_HISTORIQUE.dateRepartition,
+      periodeDebut: REPARTITION_HISTORIQUE.periodeDebut,
+      periodeFin: REPARTITION_HISTORIQUE.periodeFin,
+      montant: REPARTITION_HISTORIQUE.montant,
+      nbSalaries: REPARTITION_HISTORIQUE.employes.length,
+      totalHeures: round2(REPARTITION_HISTORIQUE.employes.reduce((s, emp) => s + emp.heures, 0)),
+      employes: REPARTITION_HISTORIQUE.employes,
+      historique: true,
+    });
+    return groupes.sort((a, b) => b.dateRepartition.localeCompare(a.dateRepartition));
+  }, [repartitions]);
+
+  const sheetPill =
+    sheetStatus === "loading" ? e("div", { style: { ...S.statusPill, background: "#efe9df", color: "#8a7d70" } },
+      e(Icon, { name: "refresh", size: 14 }), " Connexion au Sheet…"
+    ) : sheetStatus === "error" ? e("button", {
+      style: { ...S.statusPill, background: "#5c2020", color: "#ffb0b0", border: "none", cursor: "pointer" },
+      onClick: reloadFromSheet, title: "La connexion au Google Sheet a échoué — clique pour réessayer"
+    }, e(Icon, { name: "alert", size: 14 }), " Connexion échouée · réessayer"
+    ) : null;
+
+  const header = e("header", { style: S.header },
+    e("div", { style: { display: "flex", alignItems: "center", gap: 14 } },
+      e("img", { src: "logo.png", alt: "Rosario", style: S.logo }),
+      e("div", null,
+        e("div", { style: S.brand }, "Réconciliation"),
+        e("div", { style: S.sub }, debutFenetre ? `Début de cycle : ${frDate(debutFenetre)} · Aujourd'hui : ${frDate(AUJOURDHUI)}` : "Importe les exports Lightspeed et Sunday pour commencer")
+      )
+    ),
+    e("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
+      sheetPill,
+      sheetStatus === "ok" ? e("button", {
+        style: { ...S.statusPill, background: "#fff", color: "#8a7d70", border: "1px solid #ece5dc", cursor: "pointer" },
+        onClick: reloadFromSheet, title: "Resynchroniser avec le Google Sheet"
+      }, e(Icon, { name: "refresh", size: 14 })) : null,
+      rows.length > 0 ? e("div", { style: { ...S.statusPill, background: globalOK ? "#1c3a2e" : "#5c2020", color: globalOK ? "#7ee0a8" : "#ffb0b0" } },
+        e(Icon, { name: globalOK ? "check" : "alert", size: 15 }), " ", globalOK ? "Équilibré" : "Écarts à vérifier"
+      ) : null
+    )
+  );
+
+  const importBar = e("div", { style: S.importBar },
+    e("label", { style: { ...S.chip, ...(lsFileName ? S.chipDone : {}) }, title: "Lightspeed : Tous les rapports > Paiements > Période personnalisée" },
+      e(Icon, { name: lsFileName ? "check" : "upload", size: 14 }), " ", lsFileName || "Import Lightspeed (.csv)",
+      e("input", { type: "file", accept: ".csv", style: { display: "none" }, onChange: ev => ev.target.files[0] && handleFile(ev.target.files[0], "lightspeed") })
+    ),
+    e("label", { style: { ...S.chip, ...(sunFileName ? S.chipDone : {}) }, title: "Sunday : Opérations > Paiements > Période personnalisée" },
+      e(Icon, { name: sunFileName ? "check" : "upload", size: 14 }), " ", sunFileName || "Import Sunday (.csv)",
+      e("input", { type: "file", accept: ".csv", style: { display: "none" }, onChange: ev => ev.target.files[0] && handleFile(ev.target.files[0], "sunday") })
+    ),
+    e("div", { style: { flex: 1 } }),
+    e("div", { style: S.seuilInfo }, `Seuil d'alerte CB/QR : ±${SEUIL} €`)
+  );
+
+  const importHelp = e("div", { style: S.importHelp },
+    e(Icon, { name: "filedown", size: 13 }),
+    e("span", null,
+      e("b", null, "Où trouver ces fichiers ?"), " ",
+      "Lightspeed : Tous les rapports > Paiements > Période personnalisée. ",
+      "Sunday : Opérations > Paiements > Période personnalisée."
+    )
+  );
+
+  const warnBox = importWarnings.length > 0 ? e("div", { style: S.warnBox },
+    importWarnings.map((w, i) => e("div", { key: i, style: S.warnRow }, e(Icon, { name: "filewarning", size: 13 }), " ", w))
+  ) : null;
+
+  let body;
+  if (sheetStatus === "loading" && rows.length === 0) {
+    // Chargement initial du Sheet en cours — distinct de "rien à afficher",
+    // pour ne pas donner l'impression qu'il faut réimporter des CSV alors
+    // que les données sont déjà sauvegardées côté Google Sheet.
+    body = e("div", { style: S.placeholder },
+      e(Icon, { name: "refresh", size: 40, color: "#cbbfb0" }),
+      e("div", { style: { fontWeight: 700, fontSize: 16, marginTop: 12 } }, "Connexion au Google Sheet…"),
+      e("p", { style: { color: "#8a7d70", fontSize: 14, maxWidth: 460, textAlign: "center", lineHeight: 1.6 } },
+        "Récupération de l'historique déjà enregistré."
+      )
+    );
+  } else {
+    const windowBar = e("div", { style: S.windowBar },
+      e(Icon, { name: "calendar", size: 17, color: "#8B1A1A" }),
+      e("span", { style: { fontWeight: 700 } }, "Fenêtre à réconcilier :"),
+      e("label", { style: S.debutPicker },
+        e("input", { type: "date", value: debutFenetre || "", onChange: ev => setDebutCycle(ev.target.value), style: S.dateInput })
+      ),
+      e("span", { style: { color: "#a89b8d" } }, "→"),
+      e("label", { style: S.debutPicker },
+        e("input", { type: "date", value: finFenetre || "", max: finFenetreDefaut, onChange: ev => setFinCycle(ev.target.value), style: S.dateInput })
+      ),
+      e("span", { style: S.windowCount }, `${fenetre.length} jours`),
+      (debutCycle || finCycle) ? e("a", {
+        href: "#", onClick: ev => { ev.preventDefault(); setDebutCycle(null); setFinCycle(null); },
+        style: { fontSize: 12, color: "#8B1A1A" }
+      }, "réinitialiser") : null,
+      e("span", { style: { flex: 1 } }),
+      e("span", { style: S.windowNote }, e(Icon, { name: "lock", size: 12 }), ` Aujourd'hui (${frDate(AUJOURDHUI)}) toujours exclu par défaut — encore en cours`)
+    );
+
+    const tabs = e("div", { style: S.tabs },
+      [["courant", "Dépôt en cours"], ["jours", "Détail jour par jour"], ["table", "Par table"], ["historique", "Historique"], ["pourboires", "Pourboires"]].map(([k, l]) =>
+        e("button", { key: k, onClick: () => setTab(k), style: { ...S.tab, ...(tab === k ? S.tabActive : {}) } }, l)
+      )
+    );
+
+    let tabContent = null;
+    if (tab === "courant") {
+      tabContent = e(React.Fragment, null,
+        e("div", { style: S.grid3 },
+          e(ReconCard, { icon: e(Icon, { name: "coins", size: 18 }), title: "Espèces", a: { label: "Dépôt théorique (CA − dép. − Δ fonds)", val: agg.depotTheorique }, b: { label: "Espèces collectées (mises au coffre)", val: agg.misesCoffreTotal }, ecart: agg.ecartCaisseNet, ok: agg.okEsp, note: `Pourboire caisse (${euro(agg.pbCaisse)}) · Manquant (${euro(agg.manquants)}) — cf. onglet Pourboires` }),
+          e(ReconCard, { icon: e(Icon, { name: "card", size: 18 }), title: "Carte bancaire", a: { label: "CB Lightspeed", val: agg.lsCB }, b: { label: "CB Sunday", val: agg.sunCB }, ecart: agg.ecartCB, ok: agg.okCB, note: "Cumul sur la fenêtre" }),
+          e(ReconCard, { icon: e(Icon, { name: "qrcode", size: 18 }), title: "QR Code", a: { label: "QR Lightspeed", val: agg.lsQR }, b: { label: "QR Sunday", val: agg.sunQR }, ecart: agg.ecartQR, ok: agg.okQR, note: "Cumul sur la fenêtre" })
+        ),
+        e("div", { style: { ...S.clotureWrap, marginTop: 14 } },
+          e("div", { style: S.clotureMain },
+            e("div", { style: S.blockTitle }, e(Icon, { name: "building", size: 16 }), " Dépôt en banque"),
+            e(LineCalc, { label: "CA espèces (fenêtre)", val: agg.caEsp }),
+            e(LineCalc, { label: "− Dépenses espèces", val: -agg.depenses }),
+            e(LineCalc, { label: "− Δ Fonds de caisse (fin − début)", val: -agg.deltaFonds }),
+            e(LineCalc, { label: "Dépôt théorique", val: agg.depotTheorique, bold: true }),
+            e("div", { style: S.depotReel },
+              e("div", null,
+                e("div", { style: { fontSize: 12, color: "#8a7d70" } }, "À DÉPOSER EN BANQUE (arrondi dizaine inf.)"),
+                e("div", { style: { fontSize: 30, fontWeight: 800, color: "#8B1A1A" } }, euro(agg.depotReel))
+              ),
+              e(Icon, { name: "building", size: 40, color: "#e0d5c8" })
+            ),
+            e("div", { style: S.divider }),
+            e("div", { style: { fontSize: 11.5, fontWeight: 700, color: "#a89b8d", textTransform: "uppercase", letterSpacing: "0.04em", marginTop: 4 } }, "Vérification (espèces réellement collectées)"),
+            e(LineCalc, { label: "Espèces mises au coffre (cumul fenêtre)", val: agg.misesCoffreTotal }),
+            e("div", { style: { ...S.tipRow, color: Math.abs(agg.ecartCaisseNet) > 20 ? "#c25b3a" : "#8a7d70" } },
+              e("span", null, "Écart collecté vs théorique = pourboires"), e("b", null, euro(agg.ecartCaisseNet))
+            ),
+            e("div", { style: S.tipCallout },
+              e(Icon, { name: "arrowupright", size: 15, color: "#2e6a4a" }),
+              e("span", null, "Pourboire caisse ", e("b", null, euro(agg.pbCaisse)), " sorti du dépôt → versé au pot pourboires")
+            ),
+            e("button", { style: S.btnValidate, onClick: handleValiderDepot, disabled: !SCRIPT_URL, title: SCRIPT_URL ? "" : "Google Sheets pas encore connecté" },
+              `Valider le dépôt du ${frDate(AUJOURDHUI)} `, e(Icon, { name: "chevron", size: 16 })
+            ),
+            e("div", { style: S.validNote }, `Fige la fenêtre ${frDate(debutFenetre)}→${frDate(finFenetre)} dans l'historique. Prochain cycle : démarre au ${frDate(AUJOURDHUI)} inclus.`)
+          ),
+          e("div", { style: S.clotureSide },
+            e("div", { style: S.blockTitle }, e(Icon, { name: "banknote", size: 16 }), " Répartition des espèces collectées"),
+            e("div", { style: S.tipRow }, e("span", null, "Dépôt en banque"), e("b", null, euro(agg.depotReel))),
+            e("div", { style: S.tipRow }, e("span", null, "Pourboires caisse"), e("b", { style: { color: agg.ecartCaisseNet < 0 ? "#b04040" : "#3a7d5c" } }, euro(agg.ecartCaisseNet))),
+            e("div", { style: S.tipRow }, e("span", null, "Fonds de caisse parallèle"), e("b", null, euro(agg.fondsParallele))),
+            e("div", { style: { ...S.tipRow, borderTop: "1px solid #ece5dc", paddingTop: 10, marginTop: 4 } },
+              e("span", { style: { fontWeight: 700 } }, "= Espèces collectées"), e("b", { style: { color: "#8B1A1A", fontSize: 17 } }, euro(agg.depotReel + agg.ecartCaisseNet + agg.fondsParallele))
+            ),
+            e("div", { style: { ...S.tipRow, marginTop: 6, color: "#a89b8d", fontSize: 12.5 } }, e("span", null, "Pourboires CB (à part)"), e("b", null, euro(agg.pbCB))),
+            e("div", { style: { ...S.blockTitle, marginTop: 22 } }, e(Icon, { name: "calendar", size: 16 }), " Récap fenêtre"),
+            e("div", { style: S.tipRow }, e("span", null, "Jours inclus"), e("b", null, fenetre.length)),
+            e("div", { style: S.tipRow }, e("span", null, "Écart de caisse net"), e("b", { style: { color: agg.ecartCaisseNet < 0 ? "#b04040" : "#3a7d5c" } }, euro(agg.ecartCaisseNet)))
+          )
+        )
+      );
+    } else if (tab === "jours") {
+      tabContent = e("div", { style: S.tableWrap },
+        e("div", { style: S.editHint }, e(Icon, { name: "pencil", size: 13 }), ' Clique sur une valeur pour la corriger — tout se recalcule. "Ouverture", "Dépannage", "Mis au coffre" et "Esp. comptées" viennent de caisse.grupodomingo.io (éditables ici en dépannage). "Δ LS/Sun." = écart Lightspeed − Sunday (rouge si non nul). "Fonds théo." = Ouverture + CA espèces − Dépannage − Mis au coffre. "Pourboires" = Esp. comptées − Fonds théo. (positif = pourboire caisse en vert, négatif = manquant en rouge). Jours du ' + frDate(HISTORIQUE_DEBUT) + ' à aujourd\'hui, les plus récents en haut.'),
+        e("table", { style: S.table },
+          e("thead", null, e("tr", null, ["Date", "Statut", "Ouverture", "CA espèces", "CB LS", "CB Sun.", "Δ LS/Sun.", "QR LS", "QR Sun.", "Δ LS/Sun.", "Dépannage", "Mis au coffre", "Fonds théo.", "Esp. comptées", "Pourboires"].map(h => e("th", { key: h, style: S.th }, h)))),
+          e("tbody", null, joursAffiches.map(r => {
+            const inWindow = r.date >= debutFenetre && r.date <= finFenetre;
+            const isToday = r.date === AUJOURDHUI;
+            const deposited = r.date < debutFenetre;
+            const pourboires = round2((r.especesComptees || 0) - (r.fondsTheorique || 0));
+            const deltaCB = round2((r.caCB || 0) - (r.sunCB || 0));
+            const deltaQR = round2((r.caQR || 0) - (r.sunQR || 0));
+            const deltaCell = (key, delta) => e("td", { key, style: { ...S.td, color: Math.abs(delta) > 0.01 ? "#b04040" : "#8a7d70" } }, euro(delta));
+            const editableCell = champ => e("td", { key: champ, style: S.tdEdit, onClick: () => inWindow && setEdit({ date: r.date, champ }) },
+              edit && edit.date === r.date && edit.champ === champ
+                ? e("input", { autoFocus: true, defaultValue: r[champ], onBlur: ev => { updateCell(r.date, champ, ev.target.value); setEdit(null); }, onKeyDown: ev => ev.key === "Enter" && ev.target.blur(), style: S.cellInput })
+                : euro(r[champ])
+            );
+            return e("tr", { key: r.date, style: { background: isToday ? "#f3efe8" : deposited ? "#f4f1ec" : inWindow ? "#fff" : "#faf8f5", opacity: isToday || deposited ? 0.5 : 1 } },
+              e("td", { style: { ...S.td, fontWeight: 700, textAlign: "left" } }, frDate(r.date)),
+              e("td", { style: { ...S.td, textAlign: "left" } },
+                isToday ? e("span", { style: S.tag }, "en cours") : deposited ? e("span", { style: S.tagGrey }, "déposé") : null
+              ),
+              editableCell("ouverture"),
+              ...["caEsp", "caCB", "sunCB"].map(editableCell),
+              deltaCell("deltaCB", deltaCB),
+              ...["caQR", "sunQR"].map(editableCell),
+              deltaCell("deltaQR", deltaQR),
+              ...["depenses", "misesCoffre"].map(editableCell),
+              e("td", { style: S.td }, euro(r.fondsTheorique || 0)),
+              editableCell("especesComptees"),
+              e("td", { style: { ...S.td, fontWeight: 700, color: pourboires > 0 ? "#3a7d5c" : pourboires < 0 ? "#b04040" : "#8a7d70" } }, euro(pourboires))
+            );
+          }))
+        )
+      );
+    } else if (tab === "table") {
+      const bdates = Object.keys(tableRecon).sort();
+      // Ne garder que les tables dont l'écart (somme LS − somme Sunday) sur
+      // la journée est strictement différent de 0 (au centime près).
+      const daysWithEcarts = bdates
+        .map(bdate => {
+          const tables = tableRecon[bdate];
+          const ecarts = Object.entries(tables)
+            .map(([table, v]) => ({ table, lsTotal: v.lsTotal, sunTotal: v.sunTotal, ecart: round2(v.lsTotal - v.sunTotal) }))
+            .filter(x => Math.abs(x.ecart) > 0.005)
+            .sort((a, b) => Math.abs(b.ecart) - Math.abs(a.ecart));
+          return { bdate, ecarts };
+        })
+        .filter(d => d.ecarts.length > 0);
+
+      if (bdates.length === 0) {
+        tabContent = e("div", { style: S.placeholder },
+          e(Icon, { name: "qrcode", size: 40, color: "#cbbfb0" }),
+          e("div", { style: { fontWeight: 700, fontSize: 16, marginTop: 12 } }, "Rien à croiser pour l'instant"),
+          e("p", { style: { color: "#8a7d70", fontSize: 14, maxWidth: 460, textAlign: "center", lineHeight: 1.6 } },
+            "Importe Lightspeed et Sunday (format documenté, avec numéro de table) pour voir le détail par table."
+          )
+        );
+      } else if (daysWithEcarts.length === 0) {
+        tabContent = e("div", { style: S.placeholder },
+          e(Icon, { name: "check", size: 40, color: "#3a7d5c" }),
+          e("div", { style: { fontWeight: 700, fontSize: 16, marginTop: 12 } }, "Toutes les tables QR Code correspondent"),
+          e("p", { style: { color: "#8a7d70", fontSize: 14, maxWidth: 460, textAlign: "center", lineHeight: 1.6 } },
+            "Aucun écart de somme par table sur la fenêtre. Carte bleue (pdq) n'a pas de numéro de table côté Sunday : voir l'écart global dans l'onglet Dépôt en cours."
+          )
+        );
+      } else {
+        tabContent = e("div", { style: { display: "flex", flexDirection: "column", gap: 10 } },
+          e("div", { style: S.editHint }, e(Icon, { name: "qrcode", size: 13 }), " Écart = somme des paiements QR Code Lightspeed − somme des paiements QR Code Sunday, par table et par jour (seules les tables avec un écart non nul sont affichées). Carte bleue non incluse : pas de numéro de table côté Sunday (pdq)."),
+          ...daysWithEcarts.map(({ bdate, ecarts }) =>
+            e("div", { key: bdate, style: S.card },
+              e("div", { style: S.blockTitle }, e(Icon, { name: "calendar", size: 16 }), ` ${frDate(bdate)}`),
+              ...ecarts.map(x => e("div", { key: x.table, style: S.tipRow },
+                e("span", null, `Table ${x.table} — LS ${euro(x.lsTotal)} / Sunday ${euro(x.sunTotal)}`),
+                e("b", { style: { color: x.ecart > 0 ? "#c25b3a" : "#b04040" } }, euro(x.ecart))
+              ))
+            )
+          )
+        );
+      }
+    } else if (tab === "historique") {
+      tabContent = e("div", { style: S.tableWrap },
+        e("div", { style: S.editHint }, e(Icon, { name: "calendar", size: 13 }), ' Une ligne par dépôt validé. Pourboires = espèces collectées − dépôt théorique (positif = pourboire caisse en vert, négatif = manquant en rouge). Fonds parallèle = dépôt théorique − dépôt réel (reste en caisse pour l\'arrondi).'),
+        depots.length === 0
+          ? e("div", { style: { padding: 24, color: "#8a7d70", fontSize: 13.5 } }, "Pas encore de dépôt validé.")
+          : e("table", { style: S.table },
+              e("thead", null, e("tr", null, ["Date dépôt", "Période", "CA total", "Dépenses", "Delta caisse", "Dépôt théo.", "Dépôt réel", "Esp. collectées", "Pourboires", "Fonds parallèle", ""].map(h => e("th", { key: h, style: S.th }, h)))),
+              e("tbody", null, [...depots].reverse().map((d, i) => {
+                const pourboires = round2((d.pbCaisse || 0) + (d.manquants || 0));
+                const fondsParallele = round2((d.depotTheorique || 0) - (d.depotReel || 0));
+                return e("tr", { key: i, style: { background: i % 2 ? "#faf8f5" : "#fff" } },
+                  e("td", { style: { ...S.td, fontWeight: 700, textAlign: "left" } }, frDate(d.dateDepot)),
+                  e("td", { style: { ...S.td, textAlign: "left", color: "#8a7d70" } }, `${frDate(d.periodeDebut)}→${frDate(d.periodeFin)}`),
+                  e("td", { style: S.td }, euro(d.caEsp || 0)),
+                  e("td", { style: S.td }, euro(d.depenses || 0)),
+                  e("td", { style: S.td }, euro(d.deltaCaisse || 0)),
+                  e("td", { style: S.td }, euro(d.depotTheorique)),
+                  e("td", { style: { ...S.td, fontWeight: 700, color: "#8B1A1A" } }, euro(d.depotReel)),
+                  e("td", { style: S.td }, euro(d.especesCollectees || 0)),
+                  e("td", { style: { ...S.td, fontWeight: 700, color: pourboires < 0 ? "#b04040" : "#3a7d5c" } }, euro(pourboires)),
+                  e("td", { style: { ...S.td, color: "#8a7d70" } }, euro(fondsParallele)),
+                  e("td", { style: { ...S.td, textAlign: "right" } },
+                    i === 0 ? e("button", {
+                      onClick: handleSupprimerDernierDepot,
+                      title: "Supprimer ce dépôt (le dernier)",
+                      style: S.btnDeleteDepot
+                    }, e(Icon, { name: "x", size: 13, color: "#fff" })) : null
+                  )
+                );
+              }))
+            )
+      );
+    } else if (tab === "pourboires") {
+      const rc = repartitionCalc;
+      tabContent = e(React.Fragment, null,
+        e("div", { style: { ...S.clotureWrap, marginBottom: 14 } },
+          e("div", { style: S.clotureMain },
+            e("div", { style: S.blockTitle }, e(Icon, { name: "users", size: 16 }), " Répartition des pourboires espèces"),
+            e("div", { style: { ...S.lineCalc, fontWeight: 700 } },
+              e("span", null, "Pourboires cumulés depuis le dernier versement"), e("span", null, euro0(rc.cagnotte))
+            ),
+            e("div", { style: { fontSize: 12, color: "#a89b8d", marginBottom: 12 } },
+              `Depuis le ${frDate(rc.periodeDebut)} inclus jusqu'au ${frDate(rc.periodeFin)} (dernier versement : ${frDate(rc.dernierePartitionDate)}) · ${rc.joursInclus.length} jour(s) inclus`
+            ),
+            e("div", { style: S.divider }),
+            e("div", { style: { fontSize: 11.5, fontWeight: 700, color: "#a89b8d", textTransform: "uppercase", letterSpacing: "0.04em", margin: "10px 0" } }, "Import Skello (heures par employé)"),
+            e("label", { style: { ...S.chip, ...(skelloFileNames.length ? S.chipDone : {}) } },
+              e(Icon, { name: "upload", size: 15 }),
+              skelloFileNames.length ? `${skelloFileNames.length} fichier(s) importé(s)` : "Importer un ou plusieurs fichiers Skello (.xlsx)",
+              e("input", { type: "file", accept: ".xlsx", multiple: true, style: { display: "none" }, onChange: ev => { Array.from(ev.target.files || []).forEach(f => handleSkelloFile(f)); ev.target.value = ""; } })
+            ),
+            skelloFileNames.length > 0 ? e("div", { style: { fontSize: 12, color: "#8a7d70", marginTop: 8 } },
+              skelloFileNames.join(", "), " · ",
+              e("a", { href: "#", onClick: ev => { ev.preventDefault(); resetSkelloImport(); }, style: { color: "#8B1A1A" } }, "réinitialiser")
+            ) : null,
+            rc.employesAvecPart.length > 0 ? e("button", { style: S.btnValidate, onClick: handleValiderRepartition, disabled: !SCRIPT_URL, title: SCRIPT_URL ? "" : "Google Sheets pas encore connecté" },
+              `Valider la répartition du ${frDate(AUJOURDHUI)} `, e(Icon, { name: "chevron", size: 16 })
+            ) : null
+          ),
+          e("div", { style: S.clotureSide },
+            e("div", { style: S.blockTitle }, e(Icon, { name: "banknote", size: 16 }), " Récap"),
+            e("div", { style: S.tipRow }, e("span", null, "Total heures importées"), e("b", null, `${rc.totalHeures} h`)),
+            e("div", { style: S.tipRow }, e("span", null, "Employés"), e("b", null, rc.employesAvecPart.length)),
+            e("div", { style: { ...S.tipRow, borderTop: "1px solid #ece5dc", paddingTop: 10, marginTop: 4 } },
+              e("span", { style: { fontWeight: 700 } }, "Total réparti"), e("b", { style: { color: "#8B1A1A", fontSize: 17 } }, euro0(rc.totalReparti))
+            )
+          )
+        ),
+        rc.employesAvecPart.length > 0 ? e("div", { style: S.tableWrap },
+          e("table", { style: S.table },
+            e("thead", null, e("tr", null, ["Nom", "Prénom", "Heures", "Part pourboires"].map(h => e("th", { key: h, style: S.th }, h)))),
+            e("tbody", null, rc.employesAvecPart.map(emp => e("tr", { key: emp.matricule },
+              e("td", { style: { ...S.td, textAlign: "left" } }, emp.nom),
+              e("td", { style: { ...S.td, textAlign: "left" } }, emp.prenom),
+              e("td", { style: S.td }, `${emp.heures} h`),
+              e("td", { style: { ...S.td, fontWeight: 700, color: "#8B1A1A" } }, euro0(emp.montant))
+            )))
+          )
+        ) : null,
+        historiqueRepartitions.length > 0 ? e("div", { style: { marginTop: 20 } },
+          e("div", { style: { ...S.blockTitle, marginBottom: 10 } }, e(Icon, { name: "calendar", size: 16 }), " Historique des versements"),
+          e("div", { style: S.tableWrap },
+            e("table", { style: S.table },
+              e("thead", null, e("tr", null, ["Date", "Période", "Salariés", "Heures", "Montant", ""].map(h => e("th", { key: h, style: S.th }, h)))),
+              e("tbody", null, historiqueRepartitions.map((g) => {
+                const isOpen = expandedRepartition === g.dateRepartition;
+                const rows_ = [
+                  e("tr", {
+                    key: g.dateRepartition,
+                    style: { cursor: g.employes.length ? "pointer" : "default", background: isOpen ? "#faf6f0" : undefined },
+                    onClick: () => g.employes.length && setExpandedRepartition(isOpen ? null : g.dateRepartition)
+                  },
+                    e("td", { style: { ...S.td, fontWeight: 700, textAlign: "left" } }, frDate(g.dateRepartition)),
+                    e("td", { style: { ...S.td, textAlign: "left", color: "#8a7d70" } }, `${frDate(g.periodeDebut)}→${frDate(g.periodeFin)}`),
+                    e("td", { style: S.td }, g.nbSalaries ?? "—"),
+                    e("td", { style: S.td }, g.totalHeures != null ? `${g.totalHeures} h` : "—"),
+                    e("td", { style: { ...S.td, fontWeight: 700, color: "#8B1A1A" } }, euro0(g.montant)),
+                    e("td", { style: { ...S.td, textAlign: "right", color: "#a89b8d" } },
+                      g.employes.length ? e(Icon, { name: "chevron", size: 14, color: "#a89b8d" }) : null
+                    )
+                  )
+                ];
+                if (isOpen && g.employes.length) {
+                  // Lignes de détail insérées DANS le même <table> que la
+                  // ligne du versement (pas une table imbriquée à part) : les
+                  // colonnes Heures/Montant réutilisent exactement les mêmes
+                  // <td> que la ligne parente, donc les largeurs de colonnes
+                  // (calculées par le navigateur sur l'ensemble du tableau)
+                  // s'alignent automatiquement — Nom prend la place de
+                  // "Date", Prénom celle de "Période", "Salariés" reste vide.
+                  // Pas de sous-en-tête répété : les libellés de colonnes du
+                  // tableau parent (Heures/Montant) suffisent déjà.
+                  g.employes.forEach((emp, j) => {
+                    rows_.push(e("tr", { key: g.dateRepartition + "-detail-" + j, style: { background: "#faf6f0" } },
+                      e("td", { style: { ...S.td, textAlign: "left" } }, emp.nom),
+                      e("td", { style: { ...S.td, textAlign: "left" } }, emp.prenom),
+                      e("td", { style: S.td }, ""),
+                      e("td", { style: S.td }, `${emp.heures} h`),
+                      e("td", { style: S.td }, euro0(emp.montant)),
+                      e("td", { style: S.td }, "")
+                    ));
+                  });
+                } else if (isOpen && !g.employes.length) {
+                  rows_.push(e("tr", { key: g.dateRepartition + "-detail" },
+                    e("td", { colSpan: 6, style: { ...S.td, textAlign: "left", color: "#a89b8d", fontStyle: "italic", background: "#faf6f0" } },
+                      "Détail par employé non disponible pour ce versement (historique)."
+                    )
+                  ));
+                }
+                return rows_;
+              }))
+            )
+          )
+        ) : null
+      );
+    }
+
+    body = e(React.Fragment, null, windowBar, tabs, tabContent);
+  }
+
+  // Contexte envoyé à l'assistant Claude : tout ce qui est visible dans la
+  // fenêtre en cours (détail jour par jour + écarts par table non-nuls +
+  // totaux agrégés), pour qu'il puisse pointer une date/table précise sans
+  // que Théo ait à tout recopier lui-même.
+  const assistantContext = {
+    periode: { debut: debutFenetre, fin: finFenetre, joursCount: fenetre.length },
+    totaux: rows.length ? {
+      caEspeces: agg.caEsp, depenses: agg.depenses, deltaFonds: agg.deltaFonds,
+      depotTheorique: agg.depotTheorique, depotReel: agg.depotReel,
+      misesCoffreTotal: agg.misesCoffreTotal, ecartCaisseNet: agg.ecartCaisseNet,
+      pbCaisse: agg.pbCaisse, manquants: agg.manquants, pbEspDirect: agg.pbEspDirect, pbCB: agg.pbCB,
+      lsCB: agg.lsCB, sunCB: agg.sunCB, ecartCB: agg.ecartCB,
+      lsQR: agg.lsQR, sunQR: agg.sunQR, ecartQR: agg.ecartQR,
+    } : null,
+    joursDetail: fenetre.map(r => ({
+      date: r.date, caEsp: r.caEsp, caCB: r.caCB, sunCB: r.sunCB, caQR: r.caQR, sunQR: r.sunQR,
+      depenses: r.depenses, misesCoffre: r.misesCoffre, especesComptees: r.especesComptees,
+      ecartCaisse: r.ecartCaisse, fonds: r.fonds, pbCB: r.pbCB, pbEspDirect: r.pbEspDirect,
+    })),
+    ecartsParTable: Object.entries(tableRecon).flatMap(([date, tables]) =>
+      Object.entries(tables)
+        .filter(([, x]) => Math.abs((x.lsTotal || 0) - (x.sunTotal || 0)) > 0.005)
+        .map(([table, x]) => ({ date, table, lightspeed: round2(x.lsTotal || 0), sunday: round2(x.sunTotal || 0), ecart: round2((x.lsTotal || 0) - (x.sunTotal || 0)) }))
+    ),
+  };
+
+  return e(React.Fragment, null,
+    e("div", { style: S.page }, header, importBar, importHelp, warnBox, body),
+    e(AssistantBubble, { context: assistantContext, disabled: rows.length === 0 })
+  );
+}
+
+const S = {
+  page: { fontFamily: "'Sora', system-ui, sans-serif", background: "#f7f6f3", minHeight: "100vh", padding: "22px 26px", color: "#2a241f" },
+  header: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 },
+  logo: { height: 36, width: "auto", display: "block", flexShrink: 0 },
+  brand: { fontWeight: 700, fontSize: 18 },
+  sub: { fontSize: 13, color: "#8a7d70" },
+  statusPill: { display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 20, fontSize: 13, fontWeight: 600 },
+  windowBar: { display: "flex", alignItems: "center", gap: 10, background: "#fff", border: "1px solid #ece5dc", borderLeft: "3px solid #8B1A1A", borderRadius: 10, padding: "12px 16px", marginBottom: 14, fontSize: 13.5 },
+  windowCount: { background: "#faf3f0", color: "#8B1A1A", padding: "3px 10px", borderRadius: 20, fontSize: 12, fontWeight: 600 },
+  windowNote: { display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: "#a89b8d" },
+  tabs: { display: "flex", gap: 4, marginBottom: 14, borderBottom: "1px solid #e6ddd3" },
+  tab: { padding: "10px 18px", border: "none", background: "none", cursor: "pointer", fontFamily: "inherit", fontSize: 14, color: "#8a7d70", borderBottom: "2px solid transparent", marginBottom: -1 },
+  tabActive: { color: "#8B1A1A", fontWeight: 700, borderBottom: "2px solid #8B1A1A" },
+  importBar: { display: "flex", alignItems: "center", gap: 10, background: "#fff", border: "1px solid #ece5dc", borderRadius: 12, padding: "12px 16px", marginBottom: 16, flexWrap: "wrap" },
+  importHelp: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "#a89b8d", margin: "-10px 0 16px 4px" },
+  chip: { display: "flex", alignItems: "center", gap: 7, padding: "8px 14px", borderRadius: 9, border: "1px dashed #cbbfb0", background: "#faf8f5", fontSize: 13, color: "#8a7d70", cursor: "pointer" },
+  chipDone: { border: "1px solid #a8cbb6", background: "#eef6f1", color: "#2e6a4a" },
+  debutPicker: { display: "flex", alignItems: "center", gap: 7, fontSize: 12.5, color: "#8a7d70" },
+  dateInput: { fontFamily: "inherit", fontSize: 13, padding: "5px 8px", borderRadius: 6, border: "1px solid #ddd2c5" },
+  seuilInfo: { fontSize: 12, color: "#8a7d70" },
+  warnBox: { background: "#fbeae2", border: "1px solid #f0c9b4", borderRadius: 10, padding: "10px 14px", marginBottom: 14 },
+  warnRow: { display: "flex", alignItems: "center", gap: 7, fontSize: 12.5, color: "#a3491f", padding: "3px 0" },
+  grid3: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 14 },
+  card: { background: "#fff", borderRadius: 12, padding: 18, boxShadow: "0 1px 3px rgba(0,0,0,.04)" },
+  cardHead: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 },
+  badge: { width: 26, height: 26, borderRadius: 7, display: "grid", placeItems: "center" },
+  cardRow: { display: "flex", justifyContent: "space-between", padding: "7px 0", fontSize: 14, color: "#5a4d40" },
+  ecartBox: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 10, padding: "12px 14px", background: "#faf8f5", borderRadius: 9 },
+  note: { fontSize: 11.5, color: "#a89b8d", marginTop: 10, lineHeight: 1.5 },
+  clotureWrap: { display: "grid", gridTemplateColumns: "1.3fr 1fr", gap: 14 },
+  clotureMain: { background: "#fff", borderRadius: 12, padding: 22, boxShadow: "0 1px 3px rgba(0,0,0,.04)" },
+  clotureSide: { background: "#fff", borderRadius: 12, padding: 22, boxShadow: "0 1px 3px rgba(0,0,0,.04)" },
+  blockTitle: { display: "flex", alignItems: "center", gap: 8, fontWeight: 700, fontSize: 14, color: "#5a4d40", marginBottom: 14 },
+  lineCalc: { display: "flex", justifyContent: "space-between", padding: "9px 0", fontSize: 14 },
+  divider: { height: 1, background: "#ece5dc", margin: "6px 0" },
+  depotReel: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 16, padding: 18, background: "#faf3f0", borderRadius: 11, border: "1px solid #f0dcd4" },
+  tipCallout: { display: "flex", alignItems: "center", gap: 8, marginTop: 12, padding: "10px 14px", background: "#eef6f1", borderRadius: 9, fontSize: 13, color: "#2e6a4a" },
+  btnValidate: { width: "100%", marginTop: 16, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "13px", borderRadius: 10, border: "none", background: "#2f4a3a", color: "#fff", cursor: "pointer", fontFamily: "inherit", fontSize: 14.5, fontWeight: 700 },
+  btnDeleteDepot: { width: 26, height: 26, borderRadius: "50%", border: "none", background: "#b04040", color: "#fff", cursor: "pointer", display: "inline-flex", alignItems: "center", justifyContent: "center", padding: 0 },
+  validNote: { fontSize: 11.5, color: "#a89b8d", marginTop: 8, textAlign: "center" },
+  tipRow: { display: "flex", justifyContent: "space-between", padding: "8px 0", fontSize: 14, color: "#5a4d40" },
+  tableWrap: { background: "#fff", borderRadius: 12, overflow: "auto", boxShadow: "0 1px 3px rgba(0,0,0,.04)" },
+  editHint: { display: "flex", alignItems: "center", gap: 7, padding: "12px 16px", fontSize: 12.5, color: "#8a7d70", borderBottom: "1px solid #f0ebe4", background: "#faf8f5" },
+  table: { width: "100%", borderCollapse: "collapse", fontSize: 13 },
+  th: { textAlign: "right", padding: "12px 10px", background: "#2f4a3a", color: "#e8f0ea", fontWeight: 600, whiteSpace: "nowrap", fontSize: 11.5 },
+  td: { textAlign: "right", padding: "10px 10px", borderBottom: "1px solid #f0ebe4", whiteSpace: "nowrap" },
+  tdEdit: { textAlign: "right", padding: "10px 10px", borderBottom: "1px solid #f0ebe4", whiteSpace: "nowrap", cursor: "pointer" },
+  cellInput: { width: 58, padding: "4px 6px", border: "1px solid #8B1A1A", borderRadius: 5, fontFamily: "inherit", fontSize: 13, textAlign: "right" },
+  tag: { marginLeft: 7, fontSize: 10, background: "#e0d5c8", color: "#6a5d50", padding: "2px 7px", borderRadius: 10, fontWeight: 600 },
+  tagGrey: { marginLeft: 7, fontSize: 10, background: "#e8e2d9", color: "#9a8d7d", padding: "2px 7px", borderRadius: 10, fontWeight: 600 },
+  placeholder: { background: "#fff", borderRadius: 12, padding: "48px 24px", display: "flex", flexDirection: "column", alignItems: "center", boxShadow: "0 1px 3px rgba(0,0,0,.04)" },
+  assistantFab: { position: "fixed", right: 24, bottom: 24, width: 54, height: 54, borderRadius: "50%", border: "none", background: "#8B1A1A", boxShadow: "0 4px 16px rgba(139,26,26,.35)", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", zIndex: 1000 },
+  assistantPanel: { position: "fixed", right: 24, bottom: 24, width: 340, maxWidth: "calc(100vw - 48px)", height: 460, maxHeight: "calc(100vh - 48px)", background: "#fff", borderRadius: 14, boxShadow: "0 8px 32px rgba(0,0,0,.18)", display: "flex", flexDirection: "column", overflow: "hidden", zIndex: 1000 },
+  assistantHeader: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", background: "#2f4a3a", color: "#fff", fontWeight: 700, fontSize: 13.5 },
+  assistantClose: { background: "none", border: "none", color: "#fff", opacity: .75, cursor: "pointer", fontSize: 14, padding: 4 },
+  assistantMessages: { flex: 1, overflowY: "auto", padding: 14, display: "flex", flexDirection: "column", gap: 8, background: "#faf8f5" },
+  assistantHint: { fontSize: 12.5, color: "#a89b8d", lineHeight: 1.5, padding: "8px 4px" },
+  assistantMsg: { maxWidth: "85%", padding: "9px 12px", borderRadius: 10, fontSize: 13, lineHeight: 1.45, whiteSpace: "pre-wrap" },
+  assistantMsgUser: { alignSelf: "flex-end", background: "#8B1A1A", color: "#fff", borderBottomRightRadius: 3 },
+  assistantMsgBot: { alignSelf: "flex-start", background: "#fff", color: "#2a241f", border: "1px solid #ece5dc", borderBottomLeftRadius: 3 },
+  assistantInputRow: { display: "flex", gap: 8, padding: 12, borderTop: "1px solid #ece5dc", background: "#fff" },
+  assistantInput: { flex: 1, fontFamily: "inherit", fontSize: 13, padding: "9px 12px", borderRadius: 8, border: "1px solid #ddd2c5", outline: "none" },
+  assistantSend: { width: 36, height: 36, borderRadius: 8, border: "none", background: "#8B1A1A", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0 },
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(e(App));
+</script>
+</body>
+</html>
