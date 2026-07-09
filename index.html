@@ -188,15 +188,16 @@ async function askClaudeRequest(question, context, history) {
     history: JSON.stringify(trimmedHistory),
   });
   try {
-    // 45s (au lieu de 30s) depuis l'ajout du détail transactionnel au
-    // contexte (cf. askClaude_ côté Code.gs) : un prompt plus long à
-    // traiter + max_tokens relevé à 4096 peuvent prendre plus de temps,
-    // surtout sur une question qui demande de croiser beaucoup de lignes.
-    const data = await withTimeout(jsonp(`${SCRIPT_URL}?${params.toString()}`), 45000);
+    // 60s : depuis l'ajout du détail transactionnel au contexte (cf.
+    // askClaude_ côté Code.gs), une requête peut cumuler lecture de la
+    // sheet Transactions + prompt plus long à traiter + max_tokens relevé à
+    // 4096 — un premier essai à 45s s'est avéré trop court sur une question
+    // portant sur un jour chargé en transactions.
+    const data = await withTimeout(jsonp(`${SCRIPT_URL}?${params.toString()}`), 60000);
     if (data && data.status === "ok" && data.answer !== undefined) return data.answer;
     return "Réponse inattendue de l'assistant. Vérifie dans Apps Script (menu \"Exécutions\") l'appel ask_claude_sync le plus récent pour voir l'erreur exacte.";
   } catch (err) {
-    return "L'assistant n'a pas répondu à temps (>45s). Vérifie dans l'éditeur Apps Script (menu \"Exécutions\") qu'un appel ask_claude_sync apparaît bien : aucun appel → redéploie (Gérer les déploiements > crayon > Nouvelle version) ; un appel en erreur → regarde le message affiché (souvent ANTHROPIC_API_KEY manquante).";
+    return "L'assistant n'a pas répondu à temps (>60s). Vérifie dans l'éditeur Apps Script (menu \"Exécutions\") qu'un appel ask_claude_sync apparaît bien : aucun appel → redéploie (Gérer les déploiements > crayon > Nouvelle version) ; un appel en erreur → regarde le message affiché (souvent ANTHROPIC_API_KEY manquante).";
   }
 }
 
