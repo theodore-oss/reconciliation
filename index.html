@@ -503,29 +503,49 @@ function mergeDaysToRows(lsDays, sunDays, existingRows = []) {
 
 // Fusionne les données lues sur le Sheet caisse.grupodomingo.io (fond de
 // caisse, pourboires directs, mises au coffre, écart de caisse) dans les
-// lignes Journalier existantes, par date. N'écrase rien côté Lightspeed/Sunday.
+// lignes Journalier, par date. N'écrase rien côté Lightspeed/Sunday.
+//
+// Une clôture peut exister dans "Clôtures" (donc dans fondCaisseByDate) AVANT
+// même d'avoir une ligne "Journalier" — celle-ci n'est créée que par un
+// import CSV Lightspeed/Sunday (ou l'outil de resync migrer_historique).
+// Sans ça, un jour tout juste clôturé restait invisible dans l'app (espèces
+// à 0, jour absent de la fenêtre) tant que le prochain import CSV n'était
+// pas fait — corrigé en créant aussi une ligne pour les dates présentes
+// uniquement dans fondCaisseByDate, avec les champs Lightspeed/Sunday à 0
+// (remplis plus tard par l'import CSV, sans jamais écraser ce qui vient
+// d'ici).
+function applyFondCaisse_(r, fc) {
+  // Fonds de caisse théorique recalculé côté client (plutôt que de
+  // reprendre tel quel la colonne "Nouveau fonds théorique" de Clôtures,
+  // qui — sur une journée à 2 services — ne reflète que le dernier
+  // service) : ouverture du jour + CA espèces − dépannage − mises au
+  // coffre, cumulés sur la journée entière.
+  const fondsTheorique = round2((fc.ouverture || 0) + (fc.ventesEspeces || 0) - (fc.depannage || 0) - (fc.misesCoffre || 0));
+  return {
+    ...r,
+    depenses: fc.depannage,
+    especesComptees: fc.especesComptees,
+    fonds: fc.especesComptees, // fond gardé pour le lendemain
+    pbEspDirect: fc.pourboires,
+    ouverture: fc.ouverture,
+    misesCoffre: fc.misesCoffre,
+    ecartCaisse: fc.ecartCaisse,
+    fondsTheorique,
+  };
+}
 function mergeFondCaisse(rows, fondCaisseByDate) {
-  return rows.map(r => {
+  const parDate = Object.fromEntries(rows.map(r => [r.date, r]));
+  const merged = rows.map(r => {
     const fc = fondCaisseByDate[r.date];
-    if (!fc) return r;
-    // Fonds de caisse théorique recalculé côté client (plutôt que de
-    // reprendre tel quel la colonne "Nouveau fonds théorique" de Clôtures,
-    // qui — sur une journée à 2 services — ne reflète que le dernier
-    // service) : ouverture du jour + CA espèces − dépannage − mises au
-    // coffre, cumulés sur la journée entière.
-    const fondsTheorique = round2((fc.ouverture || 0) + (fc.ventesEspeces || 0) - (fc.depannage || 0) - (fc.misesCoffre || 0));
-    return {
-      ...r,
-      depenses: fc.depannage,
-      especesComptees: fc.especesComptees,
-      fonds: fc.especesComptees, // fond gardé pour le lendemain
-      pbEspDirect: fc.pourboires,
-      ouverture: fc.ouverture,
-      misesCoffre: fc.misesCoffre,
-      ecartCaisse: fc.ecartCaisse,
-      fondsTheorique,
-    };
+    return fc ? applyFondCaisse_(r, fc) : r;
   });
+  Object.keys(fondCaisseByDate).forEach(date => {
+    if (parDate[date]) return; // déjà traité ci-dessus
+    merged.push(applyFondCaisse_({
+      date, caEsp: 0, caCB: 0, caQR: 0, sunCB: 0, sunQR: 0, pbCB: 0,
+    }, fondCaisseByDate[date]));
+  });
+  return merged.sort((a, b) => a.date.localeCompare(b.date));
 }
 
 const SEUIL = 5;
