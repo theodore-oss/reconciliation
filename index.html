@@ -931,6 +931,21 @@ function App() {
           if (stats.unmappedMethods.length) {
             setImportWarnings(w => [...w, `Lightspeed : méthode(s) non reconnue(s) : ${stats.unmappedMethods.join(", ")}.`]);
           }
+          // Paiements après minuit (avant CUTOFF_HOUR) : rattachés à la
+          // veille côté business date, comme prévu — mais l'export Sunday,
+          // lui, est souvent borné par date calendaire stricte et peut ne
+          // pas couvrir cette même plage horaire. Si ça arrive, ces
+          // paiements manquent entièrement côté Sunday (pas juste mal
+          // datés) et faussent l'écart CB/QR de la veille. On ne prévient
+          // que si Lightspeed a RÉELLEMENT des paiements dans cette plage
+          // (la plupart des jours n'en ont pas) — pas un simple "le fichier
+          // Sunday s'arrête à 23:59", trop de faux positifs.
+          const postMidnight = transactions.filter(t => Number((t.time || "99").split(":")[0]) < CUTOFF_HOUR);
+          if (postMidnight.length) {
+            const totalPostMidnight = round2(postMidnight.reduce((s, t) => s + t.amount, 0));
+            const joursConcernes = [...new Set(postMidnight.map(t => t.bdate))].sort().map(frDate).join(", ");
+            setImportWarnings(w => [...w, `Lightspeed : ${postMidnight.length} paiement(s) après minuit (avant ${CUTOFF_HOUR}h, ${euro(totalPostMidnight)} au total) rattaché(s) au ${joursConcernes} — vérifie que l'export Sunday de ce jour couvre bien la même plage horaire (jusqu'à ${CUTOFF_HOUR}h le lendemain), sinon l'écart CB/QR sera faussé.`]);
+          }
         } else {
           let result;
           try {
