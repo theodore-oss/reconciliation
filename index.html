@@ -490,7 +490,13 @@ function mergeDaysToRows(lsDays, sunDays, existingRows = []) {
     const prev = existingByDate[date] || {};
     return {
       date,
-      caEsp: round2(ls.caEsp), caCB: round2(ls.caCB), caQR: round2(ls.caQR),
+      // caEsp = valeur "officielle" utilisée dans les calculs, sourcée du
+      // formulaire de clôture (Ventes espèces théoriques saisies par le
+      // staff, via le merge Clôtures ci-dessous — jamais depuis Lightspeed).
+      // Un import CSV ne la touche pas (comme depenses/especesComptees).
+      // caEspLS = valeur brute Lightspeed indépendante, toujours réimportée
+      // telle quelle, sert uniquement de référence pour le delta de contrôle.
+      caEsp: prev.caEsp ?? 0, caEspLS: round2(ls.caEsp), caCB: round2(ls.caCB), caQR: round2(ls.caQR),
       sunCB: round2(sun.sunCB), sunQR: round2(sun.sunQR), pbCB: round2(sun.pbCB),
       depenses: prev.depenses ?? 0, especesComptees: prev.especesComptees ?? 0,
       pbEspDirect: prev.pbEspDirect ?? 0, fonds: prev.fonds ?? 0,
@@ -523,6 +529,7 @@ function applyFondCaisse_(r, fc) {
   const fondsTheorique = round2((fc.ouverture || 0) + (fc.ventesEspeces || 0) - (fc.depannage || 0) - (fc.misesCoffre || 0));
   return {
     ...r,
+    caEsp: round2(fc.ventesEspeces || 0), // "CA espèces" = théorique saisi au formulaire de clôture (pas Lightspeed, cf. caEspLS)
     depenses: fc.depannage,
     especesComptees: fc.especesComptees,
     fonds: fc.especesComptees, // fond gardé pour le lendemain
@@ -542,7 +549,7 @@ function mergeFondCaisse(rows, fondCaisseByDate) {
   Object.keys(fondCaisseByDate).forEach(date => {
     if (parDate[date]) return; // déjà traité ci-dessus
     merged.push(applyFondCaisse_({
-      date, caEsp: 0, caCB: 0, caQR: 0, sunCB: 0, sunQR: 0, pbCB: 0,
+      date, caEsp: 0, caEspLS: 0, caCB: 0, caQR: 0, sunCB: 0, sunQR: 0, pbCB: 0,
     }, fondCaisseByDate[date]));
   });
   return merged.sort((a, b) => a.date.localeCompare(b.date));
@@ -922,7 +929,7 @@ function App() {
     const newRows = existe
       ? rs.map(r => r.date === date ? { ...r, [champ]: Number(val) || 0 } : r)
       : [...rs, {
-          date, caEsp: 0, caCB: 0, caQR: 0, sunCB: 0, sunQR: 0, depenses: 0,
+          date, caEsp: 0, caEspLS: 0, caCB: 0, caQR: 0, sunCB: 0, sunQR: 0, depenses: 0,
           especesComptees: 0, pbEspDirect: 0, pbCB: 0, fonds: 0, ouverture: 0, misesCoffre: 0, ecartCaisse: 0, fondsTheorique: 0,
           [champ]: Number(val) || 0,
         }].sort((a, b) => a.date.localeCompare(b.date));
@@ -939,11 +946,21 @@ function App() {
     const out = [];
     for (let d = HISTORIQUE_DEBUT; d <= AUJOURDHUI; d = addDaysIso(d, 1)) {
       out.push(parDate[d] || {
-        date: d, caEsp: 0, caCB: 0, caQR: 0, sunCB: 0, sunQR: 0, depenses: 0,
+        date: d, caEsp: 0, caEspLS: 0, caCB: 0, caQR: 0, sunCB: 0, sunQR: 0, depenses: 0,
         especesComptees: 0, pbEspDirect: 0, pbCB: 0, fonds: 0, ouverture: 0, misesCoffre: 0, ecartCaisse: 0, fondsTheorique: 0,
       });
     }
-    return out.reverse();
+    // Continuité de caisse : l'ouverture d'un jour doit être exactement égale
+    // aux espèces comptées la veille au soir — sinon il y a une rupture
+    // (erreur de saisie, ou mouvement non tracé) entre les deux clôtures. Ne
+    // se calcule que si les deux jours ont réellement une ligne côté Sheet
+    // (pas juste un jour vide comblé pour l'affichage).
+    const withContinuite = out.map(r => {
+      const veille = parDate[addDaysIso(r.date, -1)];
+      const ecartContinuite = (parDate[r.date] && veille) ? round2((r.ouverture || 0) - (veille.especesComptees || 0)) : null;
+      return { ...r, ecartContinuite };
+    });
+    return withContinuite.reverse();
   }, [rows, AUJOURDHUI]);
 
   const handleValiderDepot = async () => {
@@ -1212,33 +1229,43 @@ function App() {
       );
     } else if (tab === "jours") {
       tabContent = e("div", { style: S.tableWrap },
-        e("div", { style: S.editHint }, e(Icon, { name: "pencil", size: 13 }), ' Clique sur une valeur pour la corriger — tout se recalcule. "Ouverture", "Dépannage", "Mis au coffre" et "Esp. comptées" viennent de caisse.grupodomingo.io (éditables ici en dépannage). "Δ LS/Sun." = écart Lightspeed − Sunday (rouge si non nul). "Fonds théo." = Ouverture + CA espèces − Dépannage − Mis au coffre. "Pourboires" = Esp. comptées − Fonds théo. (positif = pourboire caisse en vert, négatif = manquant en rouge). Jours du ' + frDate(HISTORIQUE_DEBUT) + ' à aujourd\'hui, les plus récents en haut.'),
+        e("div", { style: S.editHint }, e(Icon, { name: "pencil", size: 13 }), ' Clique sur une valeur pour la corriger — tout se recalcule. "Ouverture", "CA espèces", "Dépannage", "Mis au coffre" et "Esp. comptées" viennent du formulaire de clôture caisse.grupodomingo.io (éditables ici en dépannage). "Espèces LS" = référence indépendante Lightspeed (jamais modifiée à la main) ; "Δ Espèces" = écart avec "CA espèces" (contrôle croisé, comme Δ LS/Sun. pour CB/QR). Toutes les colonnes Δ sont en rouge si l\'écart est non nul. "Ouverture" en ambre = ne correspond pas aux espèces comptées la veille (rupture de continuité). "Fonds théo." = Ouverture + CA espèces − Dépannage − Mis au coffre. "Pourboires" = Esp. comptées − Fonds théo. (positif = pourboire caisse en vert, négatif = manquant en rouge). Les jours déjà déposés restent grisés. Jours du ' + frDate(HISTORIQUE_DEBUT) + ' à aujourd\'hui, les plus récents en haut.'),
         e("table", { style: S.table },
-          e("thead", null, e("tr", null, ["Date", "Statut", "Ouverture", "CA espèces", "CB LS", "CB Sun.", "Δ LS/Sun.", "QR LS", "QR Sun.", "Δ LS/Sun.", "Dépannage", "Mis au coffre", "Fonds théo.", "Esp. comptées", "Pourboires"].map(h => e("th", { key: h, style: S.th }, h)))),
+          e("thead", null, e("tr", null, ["Date", "Ouverture", "CA espèces", "Espèces LS", "Δ Espèces", "CB LS", "CB Sun.", "Δ LS/Sun.", "QR LS", "QR Sun.", "Δ LS/Sun.", "Dépannage", "Mis au coffre", "Fonds théo.", "Esp. comptées", "Pourboires"].map(h => e("th", { key: h, style: S.th }, h)))),
           e("tbody", null, joursAffiches.map(r => {
             const inWindow = r.date >= debutFenetre && r.date <= finFenetre;
             const isToday = r.date === AUJOURDHUI;
             const deposited = r.date < debutFenetre;
             const pourboires = round2((r.especesComptees || 0) - (r.fondsTheorique || 0));
+            const deltaEsp = round2((r.caEsp || 0) - (r.caEspLS || 0));
             const deltaCB = round2((r.caCB || 0) - (r.sunCB || 0));
             const deltaQR = round2((r.caQR || 0) - (r.sunQR || 0));
-            const deltaCell = (key, delta) => e("td", { key, style: { ...S.td, color: Math.abs(delta) > 0.01 ? "#b04040" : "#8a7d70" } }, euro(delta));
-            const editableCell = champ => e("td", { key: champ, style: S.tdEdit, onClick: () => inWindow && setEdit({ date: r.date, champ }) },
+            // Surbrillance sobre commune à toutes les colonnes Δ, pour les
+            // distinguer d'un coup d'œil comme un groupe "contrôle".
+            const deltaCell = (key, delta) => e("td", { key, style: { ...S.td, ...S.deltaCell, color: Math.abs(delta) > 0.01 ? "#b04040" : "#8a7d70" } }, euro(delta));
+            const editableCell = (champ, extraStyle, title) => e("td", { key: champ, title, style: { ...S.tdEdit, ...extraStyle }, onClick: () => inWindow && setEdit({ date: r.date, champ }) },
               edit && edit.date === r.date && edit.champ === champ
                 ? e("input", { autoFocus: true, defaultValue: r[champ], onBlur: ev => { updateCell(r.date, champ, ev.target.value); setEdit(null); }, onKeyDown: ev => ev.key === "Enter" && ev.target.blur(), style: S.cellInput })
                 : euro(r[champ])
             );
+            // Continuité de caisse : ouverture du jour vs espèces comptées la
+            // veille — surbrillance ambre si rupture (erreur de saisie ou
+            // mouvement non tracé entre les deux clôtures).
+            const ecartContinuite = r.ecartContinuite;
+            const ruptureContinuite = ecartContinuite !== null && Math.abs(ecartContinuite) > 0.01;
             return e("tr", { key: r.date, style: { background: isToday ? "#f3efe8" : deposited ? "#f4f1ec" : inWindow ? "#fff" : "#faf8f5", opacity: isToday || deposited ? 0.5 : 1 } },
               e("td", { style: { ...S.td, fontWeight: 700, textAlign: "left" } }, frDate(r.date)),
-              e("td", { style: { ...S.td, textAlign: "left" } },
-                isToday ? e("span", { style: S.tag }, "en cours") : deposited ? e("span", { style: S.tagGrey }, "déposé") : null
-              ),
-              editableCell("ouverture"),
-              ...["caEsp", "caCB", "sunCB"].map(editableCell),
+              editableCell("ouverture", ruptureContinuite ? S.continuiteAlertCell : null,
+                ruptureContinuite ? `Rupture de continuité : ${euro(Math.abs(ecartContinuite))} de ${ecartContinuite > 0 ? "plus" : "moins"} que les espèces comptées la veille.` : undefined),
+              editableCell("caEsp"),
+              e("td", { style: S.td }, euro(r.caEspLS || 0)),
+              deltaCell("deltaEsp", deltaEsp),
+              editableCell("caCB"), editableCell("sunCB"),
               deltaCell("deltaCB", deltaCB),
-              ...["caQR", "sunQR"].map(editableCell),
+              editableCell("caQR"), editableCell("sunQR"),
               deltaCell("deltaQR", deltaQR),
-              ...["depenses", "misesCoffre"].map(editableCell),
+              editableCell("depenses"),
+              editableCell("misesCoffre", S.misesCoffreCell),
               e("td", { style: S.td }, euro(r.fondsTheorique || 0)),
               editableCell("especesComptees"),
               e("td", { style: { ...S.td, fontWeight: 700, color: pourboires > 0 ? "#3a7d5c" : pourboires < 0 ? "#b04040" : "#8a7d70" } }, euro(pourboires))
@@ -1511,8 +1538,14 @@ const S = {
   td: { textAlign: "right", padding: "10px 10px", borderBottom: "1px solid #f0ebe4", whiteSpace: "nowrap" },
   tdEdit: { textAlign: "right", padding: "10px 10px", borderBottom: "1px solid #f0ebe4", whiteSpace: "nowrap", cursor: "pointer" },
   cellInput: { width: 58, padding: "4px 6px", border: "1px solid #8B1A1A", borderRadius: 5, fontFamily: "inherit", fontSize: 13, textAlign: "right" },
-  tag: { marginLeft: 7, fontSize: 10, background: "#e0d5c8", color: "#6a5d50", padding: "2px 7px", borderRadius: 10, fontWeight: 600 },
-  tagGrey: { marginLeft: 7, fontSize: 10, background: "#e8e2d9", color: "#9a8d7d", padding: "2px 7px", borderRadius: 10, fontWeight: 600 },
+  // Colonnes Δ (contrôle croisé) : surbrillance sobre commune, pour les
+  // repérer d'un coup d'œil sans être criarde.
+  deltaCell: { background: "#f6f0e4" },
+  // "Mis au coffre" : fond orange clair pour bien le faire ressortir (montant
+  // physiquement déposé dans le coffre, la valeur la plus sensible de la ligne).
+  misesCoffreCell: { background: "#fdecd8" },
+  // "Ouverture" en rupture de continuité avec les espèces comptées la veille.
+  continuiteAlertCell: { background: "#fff3cd", boxShadow: "inset 0 0 0 1px #e0b64d" },
   placeholder: { background: "#fff", borderRadius: 12, padding: "48px 24px", display: "flex", flexDirection: "column", alignItems: "center", boxShadow: "0 1px 3px rgba(0,0,0,.04)" },
   assistantFab: { position: "fixed", right: 24, bottom: 24, width: 54, height: 54, borderRadius: "50%", border: "none", background: "#8B1A1A", boxShadow: "0 4px 16px rgba(139,26,26,.35)", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", zIndex: 1000 },
   assistantPanel: { position: "fixed", right: 24, bottom: 24, width: 340, maxWidth: "calc(100vw - 48px)", height: 460, maxHeight: "calc(100vh - 48px)", background: "#fff", borderRadius: 14, boxShadow: "0 8px 32px rgba(0,0,0,.18)", display: "flex", flexDirection: "column", overflow: "hidden", zIndex: 1000 },
