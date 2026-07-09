@@ -188,16 +188,17 @@ async function askClaudeRequest(question, context, history) {
     history: JSON.stringify(trimmedHistory),
   });
   try {
-    // 60s : depuis l'ajout du détail transactionnel au contexte (cf.
-    // askClaude_ côté Code.gs), une requête peut cumuler lecture de la
-    // sheet Transactions + prompt plus long à traiter + max_tokens relevé à
-    // 4096 — un premier essai à 45s s'est avéré trop court sur une question
-    // portant sur un jour chargé en transactions.
-    const data = await withTimeout(jsonp(`${SCRIPT_URL}?${params.toString()}`), 60000);
+    // 90s : une réponse détaillée (croisement de transactions) n'est pas
+    // streamée ici — on attend le texte complet avant de l'afficher, donc
+    // le temps de génération du modèle s'ajoute intégralement au temps de
+    // réponse perçu. max_tokens réduit à 2048 côté Code.gs (+ consigne de
+    // concision) pour rester sous cette limite dans la grande majorité des
+    // cas, mais on garde une marge large plutôt que de couper trop court.
+    const data = await withTimeout(jsonp(`${SCRIPT_URL}?${params.toString()}`), 90000);
     if (data && data.status === "ok" && data.answer !== undefined) return data.answer;
     return "Réponse inattendue de l'assistant. Vérifie dans Apps Script (menu \"Exécutions\") l'appel ask_claude_sync le plus récent pour voir l'erreur exacte.";
   } catch (err) {
-    return "L'assistant n'a pas répondu à temps (>60s). Vérifie dans l'éditeur Apps Script (menu \"Exécutions\") qu'un appel ask_claude_sync apparaît bien : aucun appel → redéploie (Gérer les déploiements > crayon > Nouvelle version) ; un appel en erreur → regarde le message affiché (souvent ANTHROPIC_API_KEY manquante).";
+    return "L'assistant n'a pas répondu à temps (>90s). Vérifie dans l'éditeur Apps Script (menu \"Exécutions\") qu'un appel ask_claude_sync apparaît bien : aucun appel → redéploie (Gérer les déploiements > crayon > Nouvelle version) ; un appel en erreur → regarde le message affiché (souvent ANTHROPIC_API_KEY manquante).";
   }
 }
 
