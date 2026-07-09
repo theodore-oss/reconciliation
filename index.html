@@ -1472,11 +1472,20 @@ function App() {
       lsCB: agg.lsCB, sunCB: agg.sunCB, ecartCB: agg.ecartCB,
       lsQR: agg.lsQR, sunQR: agg.sunQR, ecartQR: agg.ecartQR,
     } : null,
-    joursDetail: fenetre.map(r => ({
-      date: r.date, caEsp: r.caEsp, caCB: r.caCB, sunCB: r.sunCB, caQR: r.caQR, sunQR: r.sunQR,
-      depenses: r.depenses, misesCoffre: r.misesCoffre, especesComptees: r.especesComptees,
-      ecartCaisse: r.ecartCaisse, fonds: r.fonds, pbCB: r.pbCB, pbEspDirect: r.pbEspDirect,
-    })),
+    // ouverture + ecartContinuite inclus explicitement : sans ça l'assistant
+    // n'a aucun moyen de voir une rupture de continuité entre la clôture
+    // d'un jour et l'ouverture du lendemain (le trou qui explique l'écart
+    // fenêtre vs somme des écarts jour par jour, cf. cas 06→07/07).
+    joursDetail: fenetre.map(r => {
+      const veilleRow = rows.find(x => x.date === addDaysIso(r.date, -1));
+      const ecartContinuite = veilleRow ? round2((r.ouverture || 0) - (veilleRow.especesComptees || 0)) : null;
+      return {
+        date: r.date, ouverture: r.ouverture, caEsp: r.caEsp, caCB: r.caCB, sunCB: r.sunCB, caQR: r.caQR, sunQR: r.sunQR,
+        depenses: r.depenses, misesCoffre: r.misesCoffre, especesComptees: r.especesComptees,
+        ecartCaisse: r.ecartCaisse, fonds: r.fonds, pbCB: r.pbCB, pbEspDirect: r.pbEspDirect,
+        ecartContinuite,
+      };
+    }),
     ecartsParTable: Object.entries(tableRecon).flatMap(([date, tables]) =>
       Object.entries(tables)
         .filter(([, x]) => Math.abs((x.lsTotal || 0) - (x.sunTotal || 0)) > 0.005)
