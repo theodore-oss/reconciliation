@@ -647,41 +647,53 @@ const REPARTITION_HISTORIQUE = {
 };
 
 // ————————————————————————————————————————————————————————
-// Réconciliation par table : pour QR Code (seule méthode où Sunday connaît
-// la table, via pay-at-table), on SOMME tous les paiements Lightspeed et
-// tous les paiements Sunday d'une table sur la journée, puis on compare les
-// deux totaux. Volontairement PAS d'appariement ligne à ligne : une même
-// table peut être payée en plusieurs fois différemment d'un système à
-// l'autre (addition scindée autrement, règlement partiel...) sans que ça
-// soit une anomalie — seul un écart sur la SOMME du jour compte.
-// Carte bleue (pdq) n'a pas de numéro de table côté Sunday : pas de
-// réconciliation par table possible pour cette méthode, seul le total
-// global (déjà dans "Dépôt en cours") est pertinent.
+// Réconciliation par table : pour QR Code ET Carte bleue, on SOMME tous les
+// paiements Lightspeed et tous les paiements Sunday d'une table sur la
+// journée, puis on compare les deux totaux — par méthode (un écart QR et un
+// écart CB séparés pour une même table, jamais mélangés, pour savoir lequel
+// des deux moyens de paiement pose problème). Volontairement PAS
+// d'appariement ligne à ligne : une même table peut être payée en plusieurs
+// fois différemment d'un système à l'autre (addition scindée autrement,
+// règlement partiel...) sans que ça soit une anomalie — seul un écart sur
+// la SOMME du jour compte.
+// Lightspeed a le numéro de table pour tous les modes de paiement
+// (extractTableNumber sur AccountName, jamais filtré par méthode). Sunday,
+// lui, ne l'a historiquement fourni que pour le QR Code (pay-at-table) — si
+// son export CSV ne le donne toujours pas pour la CB (pdq), sunCB restera à
+// 0 pour toutes les tables malgré ce calcul : limite de l'export Sunday, pas
+// un bug de l'app (l'écart global CB reste de toute façon dans l'onglet
+// "Dépôt en cours").
 // ————————————————————————————————————————————————————————
 function reconcileTableAmounts(lsTransactions, sunTransactions) {
-  const byDay = {}; // bdate -> table -> { lsTotal, sunTotal }
+  const byDay = {}; // bdate -> table -> { lsQR, sunQR, lsCB, sunCB }
   const add = (t, key) => {
     byDay[t.bdate] = byDay[t.bdate] || {};
     const table = t.table || "?";
-    byDay[t.bdate][table] = byDay[t.bdate][table] || { lsTotal: 0, sunTotal: 0 };
+    byDay[t.bdate][table] = byDay[t.bdate][table] || { lsQR: 0, sunQR: 0, lsCB: 0, sunCB: 0 };
     byDay[t.bdate][table][key] += t.amount;
   };
-  lsTransactions.forEach(t => { if (t.method === "QR Code") add(t, "lsTotal"); });
-  sunTransactions.forEach(t => { if (t.method === "QR Code") add(t, "sunTotal"); });
+  lsTransactions.forEach(t => {
+    if (t.method === "QR Code") add(t, "lsQR");
+    else if (t.method === "Carte bleue") add(t, "lsCB");
+  });
+  sunTransactions.forEach(t => {
+    if (t.method === "QR Code") add(t, "sunQR");
+    else if (t.method === "Carte bleue") add(t, "sunCB");
+  });
   return byDay;
 }
 
-// Aplati byDay (date -> table -> {lsTotal, sunTotal}) en lignes {date, table,
-// lsQR|sunQR} persistables — un seul champ par ligne (celui du côté tout
-// juste importé) pour que le merge/upsert (client ET Sheet) ne touche jamais
-// l'autre côté d'une table déjà connue.
+// Aplati byDay (date -> table -> {lsQR, sunQR, lsCB, sunCB}) en lignes
+// {date, table, lsQR/lsCB|sunQR/sunCB} persistables — un seul CÔTÉ (celui
+// tout juste importé) pour que le merge/upsert (client ET Sheet) ne touche
+// jamais les valeurs de l'autre côté pour une table déjà connue.
 function flattenTableRecon_(byDay, side) {
   const out = [];
   Object.entries(byDay).forEach(([date, tables]) => {
     Object.entries(tables).forEach(([table, sums]) => {
       const row = { date, table };
-      if (side === "ls") row.lsQR = round2(sums.lsTotal || 0);
-      else row.sunQR = round2(sums.sunTotal || 0);
+      if (side === "ls") { row.lsQR = round2(sums.lsQR || 0); row.lsCB = round2(sums.lsCB || 0); }
+      else { row.sunQR = round2(sums.sunQR || 0); row.sunCB = round2(sums.sunCB || 0); }
       out.push(row);
     });
   });
@@ -695,11 +707,13 @@ function mergeTableReconRows(prev, newRows) {
   const byKey = Object.fromEntries(prev.map(r => [`${r.date}|${r.table}`, r]));
   newRows.forEach(r => {
     const key = `${r.date}|${r.table}`;
-    const existing = byKey[key] || { date: r.date, table: r.table, lsQR: 0, sunQR: 0 };
+    const existing = byKey[key] || { date: r.date, table: r.table, lsQR: 0, sunQR: 0, lsCB: 0, sunCB: 0 };
     byKey[key] = {
       ...existing,
       ...(r.lsQR !== undefined ? { lsQR: r.lsQR } : {}),
       ...(r.sunQR !== undefined ? { sunQR: r.sunQR } : {}),
+      ...(r.lsCB !== undefined ? { lsCB: r.lsCB } : {}),
+      ...(r.sunCB !== undefined ? { sunCB: r.sunCB } : {}),
     };
   });
   return Object.values(byKey);
@@ -1111,7 +1125,7 @@ function App() {
     tableReconRows.forEach(r => {
       if (r.date < debutFenetre || r.date >= AUJOURDHUI) return;
       out[r.date] = out[r.date] || {};
-      out[r.date][r.table] = { lsTotal: r.lsQR || 0, sunTotal: r.sunQR || 0 };
+      out[r.date][r.table] = { lsQR: r.lsQR || 0, sunQR: r.sunQR || 0, lsCB: r.lsCB || 0, sunCB: r.sunCB || 0 };
     });
     return out;
   }, [tableReconRows, debutFenetre, AUJOURDHUI]);
@@ -1427,8 +1441,14 @@ function App() {
         .map(bdate => {
           const tables = tableRecon[bdate];
           const ecarts = Object.entries(tables)
-            .map(([table, v]) => ({ table, lsTotal: v.lsTotal, sunTotal: v.sunTotal, ecart: round2(v.lsTotal - v.sunTotal) }))
-            .filter(x => Math.abs(x.ecart) > 0.005)
+            .flatMap(([table, v]) => {
+              const rowsForTable = [];
+              const ecartQR = round2((v.lsQR || 0) - (v.sunQR || 0));
+              const ecartCB = round2((v.lsCB || 0) - (v.sunCB || 0));
+              if (Math.abs(ecartQR) > 0.005) rowsForTable.push({ table, methode: "QR Code", lsTotal: v.lsQR, sunTotal: v.sunQR, ecart: ecartQR });
+              if (Math.abs(ecartCB) > 0.005) rowsForTable.push({ table, methode: "Carte bleue", lsTotal: v.lsCB, sunTotal: v.sunCB, ecart: ecartCB });
+              return rowsForTable;
+            })
             .sort((a, b) => Math.abs(b.ecart) - Math.abs(a.ecart));
           return { bdate, ecarts };
         })
@@ -1445,19 +1465,21 @@ function App() {
       } else if (daysWithEcarts.length === 0) {
         tabContent = e("div", { style: S.placeholder },
           e(Icon, { name: "check", size: 40, color: "#3a7d5c" }),
-          e("div", { style: { fontWeight: 700, fontSize: 16, marginTop: 12 } }, "Toutes les tables QR Code correspondent"),
+          e("div", { style: { fontWeight: 700, fontSize: 16, marginTop: 12 } }, "Toutes les tables correspondent"),
           e("p", { style: { color: "#8a7d70", fontSize: 14, maxWidth: 460, textAlign: "center", lineHeight: 1.6 } },
-            "Aucun écart de somme par table sur la fenêtre. Carte bleue (pdq) n'a pas de numéro de table côté Sunday : voir l'écart global dans l'onglet Dépôt en cours."
+            "Aucun écart de somme par table sur la fenêtre (QR Code et Carte bleue)."
           )
         );
       } else {
         tabContent = e("div", { style: { display: "flex", flexDirection: "column", gap: 10 } },
-          e("div", { style: S.editHint }, e(Icon, { name: "qrcode", size: 13 }), " Écart = somme des paiements QR Code Lightspeed − somme des paiements QR Code Sunday, par table et par jour (seules les tables avec un écart non nul sont affichées). Carte bleue non incluse : pas de numéro de table côté Sunday (pdq)."),
+          e("div", { style: S.editHint }, e(Icon, { name: "qrcode", size: 13 }),
+            " Écart = somme des paiements Lightspeed − somme des paiements Sunday, par table/méthode/jour (seules les tables avec un écart non nul sont affichées). Si Sunday ne fournit pas le numéro de table pour la carte bleue (pdq) — ça dépend de l'export — l'écart CB par table restera vide même si l'écart global (onglet Dépôt en cours) est correct."
+          ),
           ...daysWithEcarts.map(({ bdate, ecarts }) =>
             e("div", { key: bdate, style: S.card },
               e("div", { style: S.blockTitle }, e(Icon, { name: "calendar", size: 16 }), ` ${frDate(bdate)}`),
-              ...ecarts.map(x => e("div", { key: x.table, style: S.tipRow },
-                e("span", null, `Table ${x.table} — LS ${euro(x.lsTotal)} / Sunday ${euro(x.sunTotal)}`),
+              ...ecarts.map(x => e("div", { key: `${x.table}-${x.methode}`, style: S.tipRow },
+                e("span", null, `Table ${x.table} (${x.methode}) — LS ${euro(x.lsTotal)} / Sunday ${euro(x.sunTotal)}`),
                 e("b", { style: { color: x.ecart > 0 ? "#c25b3a" : "#b04040" } }, euro(x.ecart))
               ))
             )
@@ -1633,9 +1655,14 @@ function App() {
       };
     }),
     ecartsParTable: Object.entries(tableRecon).flatMap(([date, tables]) =>
-      Object.entries(tables)
-        .filter(([, x]) => Math.abs((x.lsTotal || 0) - (x.sunTotal || 0)) > 0.005)
-        .map(([table, x]) => ({ date, table, lightspeed: round2(x.lsTotal || 0), sunday: round2(x.sunTotal || 0), ecart: round2((x.lsTotal || 0) - (x.sunTotal || 0)) }))
+      Object.entries(tables).flatMap(([table, x]) => {
+        const out = [];
+        const ecartQR = round2((x.lsQR || 0) - (x.sunQR || 0));
+        const ecartCB = round2((x.lsCB || 0) - (x.sunCB || 0));
+        if (Math.abs(ecartQR) > 0.005) out.push({ date, table, methode: "QR Code", lightspeed: round2(x.lsQR || 0), sunday: round2(x.sunQR || 0), ecart: ecartQR });
+        if (Math.abs(ecartCB) > 0.005) out.push({ date, table, methode: "Carte bleue", lightspeed: round2(x.lsCB || 0), sunday: round2(x.sunCB || 0), ecart: ecartCB });
+        return out;
+      })
     ),
   };
 
