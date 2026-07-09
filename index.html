@@ -38,7 +38,11 @@ const e = React.createElement;
 // (contourne les soucis CORS), fetch GET/POST classique pour écrire.
 // Projet Apps Script séparé de celui de caisse (aucun risque pour la prod).
 // ————————————————————————————————————————————————————————
-const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwlPFi6zfhU9-Bzj8Lz6KEdNdGskfEVntOE7XX8penAlzLjfYKMccv8X9YgtLxShnK18Q/exec";
+// Déploiement DÉDIÉ, distinct de celui du formulaire de clôture (Caisse/
+// index.html), restreint à "Anyone within grupodomingo.io" — le formulaire
+// de clôture garde lui son propre déploiement en "Anyone" (staff sans
+// compte Google, juste le code PIN), sur le même script/Sheet.
+const SCRIPT_URL = "https://script.google.com/a/macros/grupodomingo.io/s/AKfycbxJTaRH3VkmOXGfornNZ4TNNjQWd4VcIc6gWwZxUJFReHJYstttakUSCdiA-CimpwWzJw/exec";
 // Le déploiement Apps Script doit rester "Anyone" (nécessaire pour le JSONP
 // ci-dessous), donc cette clé sert de verrou minimal contre un accès direct
 // au Sheet par quelqu'un qui devine/scanne l'URL sans jamais avoir vu cette
