@@ -368,10 +368,20 @@ function parseLightspeedBuffer(arrayBuffer) {
     if (Number.isNaN(amount)) continue;
     const method = normalizeMethod(row.Method);
     if (!method) { if (row.Method) unmappedMethods.add(row.Method); continue; }
-    if (!days[bdate]) days[bdate] = { caEsp: 0, caCB: 0, caQR: 0 };
+    if (!days[bdate]) days[bdate] = { caEsp: 0, caCB: 0, caQR: 0, lsPostMinuitCB: 0, lsPostMinuitQR: 0 };
     if (method === "Espèces") days[bdate].caEsp += amount;
     else if (method === "Carte bleue") days[bdate].caCB += amount;
     else if (method === "QR Code") days[bdate].caQR += amount;
+    // Paiement après minuit (avant CUTOFF_HOUR) : déjà correctement rattaché
+    // à bdate (la veille) ci-dessus — on garde en plus une trace séparée du
+    // montant par méthode, pour pouvoir signaler qu'un écart CB/QR peut
+    // s'expliquer par un export Sunday qui ne couvre pas cette même plage
+    // horaire (borné par date calendaire chez eux, contrairement à
+    // Lightspeed qui capture la suite du service jusqu'au petit matin).
+    if (dp.hour < CUTOFF_HOUR) {
+      if (method === "Carte bleue") days[bdate].lsPostMinuitCB += amount;
+      else if (method === "QR Code") days[bdate].lsPostMinuitQR += amount;
+    }
 
     const time = `${pad2(dp.hour)}:${pad2(dp.minute)}`;
     const table = extractTableNumber(row.AccountName);
@@ -506,13 +516,13 @@ function parseSkelloBuffer(arrayBuffer) {
 }
 
 function round2(n) { return Math.round((n + Number.EPSILON) * 100) / 100; }
-function extractLsDays(rows) { const out = {}; rows.forEach(r => out[r.date] = { caEsp: r.caEsp, caCB: r.caCB, caQR: r.caQR }); return out; }
+function extractLsDays(rows) { const out = {}; rows.forEach(r => out[r.date] = { caEsp: r.caEsp, caCB: r.caCB, caQR: r.caQR, lsPostMinuitCB: r.lsPostMinuitCB, lsPostMinuitQR: r.lsPostMinuitQR }); return out; }
 function extractSunDays(rows) { const out = {}; rows.forEach(r => out[r.date] = { sunCB: r.sunCB, sunQR: r.sunQR, pbCB: r.pbCB, pbQR: 0 }); return out; }
 function mergeDaysToRows(lsDays, sunDays, existingRows = []) {
   const existingByDate = Object.fromEntries(existingRows.map(r => [r.date, r]));
   const allDates = new Set([...Object.keys(lsDays), ...Object.keys(sunDays), ...Object.keys(existingByDate)]);
   return Array.from(allDates).sort().map(date => {
-    const ls = lsDays[date] || { caEsp: 0, caCB: 0, caQR: 0 };
+    const ls = lsDays[date] || { caEsp: 0, caCB: 0, caQR: 0, lsPostMinuitCB: 0, lsPostMinuitQR: 0 };
     const sun = sunDays[date] || { sunCB: 0, sunQR: 0, pbCB: 0, pbQR: 0 };
     const prev = existingByDate[date] || {};
     return {
@@ -527,6 +537,10 @@ function mergeDaysToRows(lsDays, sunDays, existingRows = []) {
       sunCB: round2(sun.sunCB), sunQR: round2(sun.sunQR), pbCB: round2(sun.pbCB),
       depenses: prev.depenses ?? 0, especesComptees: prev.especesComptees ?? 0,
       pbEspDirect: prev.pbEspDirect ?? 0, fonds: prev.fonds ?? 0,
+      // Part des paiements Lightspeed de ce jour survenus après minuit,
+      // toujours réimportée telle quelle (comme caCB/caQR) — cf. avertissement
+      // sur les cartes CB/QR.
+      lsPostMinuitCB: round2(ls.lsPostMinuitCB || 0), lsPostMinuitQR: round2(ls.lsPostMinuitQR || 0),
       // Sourcées en lecture seule depuis le Sheet caisse.grupodomingo.io :
       ouverture: prev.ouverture ?? 0, misesCoffre: prev.misesCoffre ?? 0, ecartCaisse: prev.ecartCaisse ?? 0,
       fondsTheorique: prev.fondsTheorique ?? 0,
@@ -722,7 +736,7 @@ function mergeTableReconRows(prev, newRows) {
 // ————————————————————————————————————————————————————————
 // Sous-composants
 // ————————————————————————————————————————————————————————
-function ReconCard({ icon, title, a, b, ecart, ok, note }) {
+function ReconCard({ icon, title, a, b, ecart, ok, note, warning }) {
   return e("div", { style: { ...S.card, borderTop: `3px solid ${ok ? "#3a7d5c" : "#c25b3a"}` } },
     e("div", { style: S.cardHead },
       e("div", { style: { display: "flex", alignItems: "center", gap: 8, color: "#5a4d40" } }, icon, e("b", null, title)),
@@ -734,7 +748,10 @@ function ReconCard({ icon, title, a, b, ecart, ok, note }) {
       e("span", { style: { fontSize: 12, color: "#8a7d70" } }, "ÉCART"),
       e("span", { style: { fontSize: 22, fontWeight: 800, color: ok ? "#3a7d5c" : "#c25b3a" } }, euro(ecart))
     ),
-    e("div", { style: S.note }, note)
+    e("div", { style: S.note }, note),
+    warning ? e("div", { style: { marginTop: 8, padding: "8px 10px", background: "#fbeae2", borderRadius: 8, fontSize: 12.5, color: "#b04a26", lineHeight: 1.5, display: "flex", gap: 6, alignItems: "flex-start" } },
+      e(Icon, { name: "alert", size: 13 }), e("span", null, warning)
+    ) : null
   );
 }
 function LineCalc({ label, val, bold, muted }) {
@@ -931,21 +948,12 @@ function App() {
           if (stats.unmappedMethods.length) {
             setImportWarnings(w => [...w, `Lightspeed : méthode(s) non reconnue(s) : ${stats.unmappedMethods.join(", ")}.`]);
           }
-          // Paiements après minuit (avant CUTOFF_HOUR) : rattachés à la
-          // veille côté business date, comme prévu — mais l'export Sunday,
-          // lui, est souvent borné par date calendaire stricte et peut ne
-          // pas couvrir cette même plage horaire. Si ça arrive, ces
-          // paiements manquent entièrement côté Sunday (pas juste mal
-          // datés) et faussent l'écart CB/QR de la veille. On ne prévient
-          // que si Lightspeed a RÉELLEMENT des paiements dans cette plage
-          // (la plupart des jours n'en ont pas) — pas un simple "le fichier
-          // Sunday s'arrête à 23:59", trop de faux positifs.
-          const postMidnight = transactions.filter(t => Number((t.time || "99").split(":")[0]) < CUTOFF_HOUR);
-          if (postMidnight.length) {
-            const totalPostMidnight = round2(postMidnight.reduce((s, t) => s + t.amount, 0));
-            const joursConcernes = [...new Set(postMidnight.map(t => t.bdate))].sort().map(frDate).join(", ");
-            setImportWarnings(w => [...w, `Lightspeed : ${postMidnight.length} paiement(s) après minuit (avant ${CUTOFF_HOUR}h, ${euro(totalPostMidnight)} au total) rattaché(s) au ${joursConcernes} — vérifie que l'export Sunday de ce jour couvre bien la même plage horaire (jusqu'à ${CUTOFF_HOUR}h le lendemain), sinon l'écart CB/QR sera faussé.`]);
-          }
+          // Paiements après minuit (avant CUTOFF_HOUR) : plus d'avertissement
+          // ponctuel ici — le montant est persisté par jour (lsPostMinuitCB/QR,
+          // cf. parseLightspeedBuffer) et l'avertissement est recalculé en
+          // permanence sur les cartes CB/QR de l'onglet "Dépôt en cours"
+          // (visible tant qu'un écart réel + des paiements après minuit
+          // coexistent sur la fenêtre, pas seulement au moment de l'import).
         } else {
           let result;
           try {
@@ -1019,6 +1027,7 @@ function App() {
     const caEsp = sum("caEsp"), depenses = sum("depenses");
     const lsCB = sum("caCB"), sunCB = sum("sunCB"), lsQR = sum("caQR"), sunQR = sum("sunQR");
     const pbCB = sum("pbCB"), pbEspDirect = sum("pbEspDirect");
+    const lsPostMinuitCB = sum("lsPostMinuitCB"), lsPostMinuitQR = sum("lsPostMinuitQR");
     const misesCoffreTotal = sum("misesCoffre"); // espèces réellement collectées (mises au coffre)
     const veille = debutFenetre ? addDaysIso(debutFenetre, -1) : null;
     const rowFondsDebut = rows.find(r => r.date === veille);
@@ -1051,7 +1060,7 @@ function App() {
     return {
       caEsp, depenses, fondsDebut, fondsFin, deltaFonds, lsCB, sunCB, lsQR, sunQR, pbCB, pbEspDirect, misesCoffreTotal,
       pbCaisse, manquants, ecartCaisseNet, depotTheorique, depotReel, fondsParallele,
-      ecartsContinuiteTotal, nbRupturesContinuite,
+      ecartsContinuiteTotal, nbRupturesContinuite, lsPostMinuitCB, lsPostMinuitQR,
       ecartCB: lsCB - sunCB, ecartQR: lsQR - sunQR,
       okCB: Math.abs(lsCB - sunCB) <= SEUIL, okQR: Math.abs(lsQR - sunQR) <= SEUIL,
       okEsp: Math.abs(ecartCaisseNet) <= 20,
@@ -1069,6 +1078,7 @@ function App() {
       : [...rs, {
           date, caEsp: 0, caEspLS: 0, caCB: 0, caQR: 0, sunCB: 0, sunQR: 0, depenses: 0,
           especesComptees: 0, pbEspDirect: 0, pbCB: 0, fonds: 0, ouverture: 0, misesCoffre: 0, ecartCaisse: 0, fondsTheorique: 0,
+          lsPostMinuitCB: 0, lsPostMinuitQR: 0,
           [champ]: Number(val) || 0,
         }].sort((a, b) => a.date.localeCompare(b.date));
     const updated = newRows.find(r => r.date === date);
@@ -1086,6 +1096,7 @@ function App() {
       out.push(parDate[d] || {
         date: d, caEsp: 0, caEspLS: 0, caCB: 0, caQR: 0, sunCB: 0, sunQR: 0, depenses: 0,
         especesComptees: 0, pbEspDirect: 0, pbCB: 0, fonds: 0, ouverture: 0, misesCoffre: 0, ecartCaisse: 0, fondsTheorique: 0,
+        lsPostMinuitCB: 0, lsPostMinuitQR: 0,
       });
     }
     // Continuité de caisse : l'ouverture d'un jour doit être exactement égale
@@ -1355,8 +1366,22 @@ function App() {
       tabContent = e(React.Fragment, null,
         e("div", { style: S.grid3 },
           e(ReconCard, { icon: e(Icon, { name: "coins", size: 18 }), title: "Espèces", a: { label: "Dépôt théorique (CA − dép. − Δ fonds)", val: agg.depotTheorique }, b: { label: "Espèces collectées (mises au coffre)", val: agg.misesCoffreTotal }, ecart: agg.ecartCaisseNet, ok: agg.okEsp, note: `Pourboire caisse (${euro(agg.pbCaisse)}) · Manquant (${euro(agg.manquants)}) — cf. onglet Pourboires` }),
-          e(ReconCard, { icon: e(Icon, { name: "card", size: 18 }), title: "Carte bancaire", a: { label: "CB Lightspeed", val: agg.lsCB }, b: { label: "CB Sunday", val: agg.sunCB }, ecart: agg.ecartCB, ok: agg.okCB, note: "Cumul sur la fenêtre" }),
-          e(ReconCard, { icon: e(Icon, { name: "qrcode", size: 18 }), title: "QR Code", a: { label: "QR Lightspeed", val: agg.lsQR }, b: { label: "QR Sunday", val: agg.sunQR }, ecart: agg.ecartQR, ok: agg.okQR, note: "Cumul sur la fenêtre" })
+          e(ReconCard, {
+            icon: e(Icon, { name: "card", size: 18 }), title: "Carte bancaire",
+            a: { label: "CB Lightspeed", val: agg.lsCB }, b: { label: "CB Sunday", val: agg.sunCB },
+            ecart: agg.ecartCB, ok: agg.okCB, note: "Cumul sur la fenêtre",
+            warning: (!agg.okCB && agg.lsPostMinuitCB > 0.01)
+              ? `${euro(agg.lsPostMinuitCB)} de paiements CB Lightspeed après minuit sur la fenêtre — vérifie que l'export Sunday de ces jours couvre bien la même plage horaire (jusqu'à ${CUTOFF_HOUR}h le lendemain), sinon l'écart est faussé par un trou de données côté Sunday, pas une vraie différence.`
+              : null,
+          }),
+          e(ReconCard, {
+            icon: e(Icon, { name: "qrcode", size: 18 }), title: "QR Code",
+            a: { label: "QR Lightspeed", val: agg.lsQR }, b: { label: "QR Sunday", val: agg.sunQR },
+            ecart: agg.ecartQR, ok: agg.okQR, note: "Cumul sur la fenêtre",
+            warning: (!agg.okQR && agg.lsPostMinuitQR > 0.01)
+              ? `${euro(agg.lsPostMinuitQR)} de paiements QR Lightspeed après minuit sur la fenêtre — vérifie que l'export Sunday de ces jours couvre bien la même plage horaire (jusqu'à ${CUTOFF_HOUR}h le lendemain), sinon l'écart est faussé par un trou de données côté Sunday, pas une vraie différence.`
+              : null,
+          })
         ),
         e("div", { style: { ...S.clotureWrap, marginTop: 14 } },
           e("div", { style: S.clotureMain },
