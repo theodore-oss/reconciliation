@@ -85,6 +85,7 @@ function fetchAction_(action, fallback) {
 const fetchJournalier = fetchAction_("get_journalier", []);
 const fetchDepots = fetchAction_("get_depots", []);
 const fetchFondCaisse = fetchAction_("get_fond_caisse", {});
+const fetchTableRecon = fetchAction_("get_table_recon", []);
 function serializeParams(obj) {
   const params = new URLSearchParams();
   Object.entries(obj).forEach(([k, v]) => { if (v !== undefined && v !== null) params.set(k, String(v)); });
@@ -108,14 +109,30 @@ async function supprimerDernierDepotRequest() {
   } catch (err) { return { status: "error" }; }
 }
 async function importJournalierBulk(rows) {
-  if (!SCRIPT_URL || rows.length === 0) return;
+  if (!SCRIPT_URL || rows.length === 0) return { ok: true };
   try {
-    await fetch(SCRIPT_URL, {
+    const res = await fetch(SCRIPT_URL, {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },
       body: JSON.stringify({ rows, key: RECON_ACCESS_KEY }),
     });
-  } catch (err) {}
+    return { ok: res.ok };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+async function importTableReconBulk(rows) {
+  if (!SCRIPT_URL || rows.length === 0) return { ok: true };
+  try {
+    const res = await fetch(SCRIPT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ action: "import_table_recon", rows, key: RECON_ACCESS_KEY }),
+    });
+    return { ok: res.ok };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
 }
 const fetchRepartitions = fetchAction_("get_repartitions", []);
 async function validerRepartitionRequest(payload) {
@@ -644,6 +661,40 @@ function reconcileTableAmounts(lsTransactions, sunTransactions) {
   return byDay;
 }
 
+// Aplati byDay (date -> table -> {lsTotal, sunTotal}) en lignes {date, table,
+// lsQR|sunQR} persistables — un seul champ par ligne (celui du côté tout
+// juste importé) pour que le merge/upsert (client ET Sheet) ne touche jamais
+// l'autre côté d'une table déjà connue.
+function flattenTableRecon_(byDay, side) {
+  const out = [];
+  Object.entries(byDay).forEach(([date, tables]) => {
+    Object.entries(tables).forEach(([table, sums]) => {
+      const row = { date, table };
+      if (side === "ls") row.lsQR = round2(sums.lsTotal || 0);
+      else row.sunQR = round2(sums.sunTotal || 0);
+      out.push(row);
+    });
+  });
+  return out;
+}
+
+// Fusionne des lignes fraîchement calculées dans l'état local (persisté
+// côté Sheet) — même logique upsert-par-clé que côté backend, pour que
+// l'affichage reflète immédiatement l'import sans attendre le round-trip.
+function mergeTableReconRows(prev, newRows) {
+  const byKey = Object.fromEntries(prev.map(r => [`${r.date}|${r.table}`, r]));
+  newRows.forEach(r => {
+    const key = `${r.date}|${r.table}`;
+    const existing = byKey[key] || { date: r.date, table: r.table, lsQR: 0, sunQR: 0 };
+    byKey[key] = {
+      ...existing,
+      ...(r.lsQR !== undefined ? { lsQR: r.lsQR } : {}),
+      ...(r.sunQR !== undefined ? { sunQR: r.sunQR } : {}),
+    };
+  });
+  return Object.values(byKey);
+}
+
 // ————————————————————————————————————————————————————————
 // Sous-composants
 // ————————————————————————————————————————————————————————
@@ -743,14 +794,14 @@ function App() {
   const [importWarnings, setImportWarnings] = useState([]);
   const [debutCycle, setDebutCycle] = useState(null);
   const [finCycle, setFinCycle] = useState(null);
-  const [lsTransactions, setLsTransactions] = useState([]);
-  const [sunTransactions, setSunTransactions] = useState([]);
+  const [tableReconRows, setTableReconRows] = useState([]); // persisté sur le Sheet (ReconciliationTable) — survit au refresh
   const [depots, setDepots] = useState([]);
   const [repartitions, setRepartitions] = useState([]);
   const [employesHeures, setEmployesHeures] = useState({}); // matricule -> {nom, prenom, heures}
   const [skelloFileNames, setSkelloFileNames] = useState([]);
   const [expandedRepartition, setExpandedRepartition] = useState(null); // dateRepartition dépliée dans l'historique pourboires
   const [sheetStatus, setSheetStatus] = useState(SCRIPT_URL ? "loading" : "off");
+  const [saveStatus, setSaveStatus] = useState(null); // { kind: "saving"|"ok"|"error", label }
 
   const AUJOURDHUI = todayIso();
   const earliestRowDate = rows.length ? rows.reduce((min, r) => (r.date < min ? r.date : min), rows[0].date) : null;
@@ -781,7 +832,7 @@ function App() {
     let cancelled = false;
     setSheetStatus("loading");
     (async () => {
-      const [jRows, dRows, fcRows, rRows] = await Promise.all([fetchJournalier(), fetchDepots(), fetchFondCaisse(), fetchRepartitions()]);
+      const [jRows, dRows, fcRows, rRows, trRows] = await Promise.all([fetchJournalier(), fetchDepots(), fetchFondCaisse(), fetchRepartitions(), fetchTableRecon()]);
       if (cancelled) return;
       setFondCaisse(fcRows);
       // Premier chargement (rows encore vide) : on prend telles quelles les
@@ -791,6 +842,7 @@ function App() {
       if (jRows.length) setRows(prev => (prev.length && reloadTick === 0 ? prev : mergeFondCaisse(jRows, fcRows)));
       setDepots(dRows);
       setRepartitions(rRows);
+      setTableReconRows(prev => (prev.length && reloadTick === 0 ? prev : trRows));
       setSheetStatus("ok");
     })().catch(() => { if (!cancelled) setSheetStatus("error"); });
     return () => { cancelled = true; };
@@ -804,6 +856,19 @@ function App() {
     setRows(prev => mergeFondCaisse(prev, fondCaisse));
   }, [fondCaisse]);
 
+  // Enregistrement explicite dans le Sheet après un import CSV, avec statut
+  // visible (au lieu du fire-and-forget silencieux d'avant — Théo n'avait
+  // aucun moyen de savoir si un import avait vraiment été sauvegardé).
+  const saveImport = useCallback((merged, label, tableRows = []) => {
+    setSaveStatus({ kind: "saving", label: `Enregistrement (${label})…` });
+    Promise.all([importJournalierBulk(merged), importTableReconBulk(tableRows)]).then(([res, resTable]) => {
+      const ok = res.ok && resTable.ok;
+      setSaveStatus(ok
+        ? { kind: "ok", label: `✓ ${label} sauvegardé dans le Sheet.` }
+        : { kind: "error", label: `✗ Échec de sauvegarde (${label}) — vérifie ta connexion et réessaie.`, retry: () => saveImport(merged, label, tableRows) });
+    });
+  }, []);
+
   const handleFile = useCallback((file, kind) => {
     const reader = new FileReader();
     reader.onload = () => {
@@ -813,11 +878,23 @@ function App() {
           const { days, stats, transactions } = parseLightspeedBuffer(buf);
           setLsFileName(file.name);
           setRows(prev => {
-            const merged = mergeDaysToRows(days, extractSunDays(prev), prev);
-            importJournalierBulk(merged);
+            // Fusionner avec l'historique Lightspeed déjà connu (Sheet ou
+            // imports précédents) AVANT de passer à mergeDaysToRows — sinon
+            // les dates absentes de CE fichier (donc tout ce qui n'est pas
+            // dans la semaine tout juste importée) sont remises à 0 et ce 0
+            // écrase le Sheet. "days" (le nouveau fichier) a priorité sur
+            // extractLsDays(prev) pour les dates communes (réimport = mise à
+            // jour, comportement idempotent).
+            const merged = mergeDaysToRows({ ...extractLsDays(prev), ...days }, extractSunDays(prev), prev);
+            // Réconciliation par table (QR uniquement) : ne calcule/n'envoie
+            // que le côté Lightspeed, fusionné localement pour l'affichage
+            // immédiat puis persisté (upsert, ne touche pas les valeurs
+            // Sunday déjà connues pour ces tables).
+            const lsTableRows = flattenTableRecon_(reconcileTableAmounts(transactions, []), "ls");
+            setTableReconRows(prevTR => mergeTableReconRows(prevTR, lsTableRows));
+            saveImport(merged, file.name, lsTableRows);
             return merged;
           });
-          setLsTransactions(transactions);
           if (Object.keys(stats.excludedTypeCounts).some(k => k.startsWith("UNKNOWN"))) {
             setImportWarnings(w => [...w, `Lightspeed : type(s) de transaction inconnu(s) — vérifier ${file.name}.`]);
           }
@@ -836,10 +913,11 @@ function App() {
           setSunFileName(file.name);
           setRows(prev => {
             const merged = mergeDaysToRows(extractLsDays(prev), result.days, prev);
-            importJournalierBulk(merged);
+            const sunTableRows = flattenTableRecon_(reconcileTableAmounts([], result.transactions || []), "sun");
+            setTableReconRows(prevTR => mergeTableReconRows(prevTR, sunTableRows));
+            saveImport(merged, file.name, sunTableRows);
             return merged;
           });
-          setSunTransactions(result.transactions || []);
         }
       } catch (err) {
         setImportWarnings(w => [...w, `Erreur de lecture de ${file.name} : ${err.message}`]);
@@ -1007,12 +1085,19 @@ function App() {
     }
   };
 
+  // Sourcé depuis tableReconRows (persisté sur le Sheet, cf. saveImport) au
+  // lieu des transactions brutes en mémoire — survit au refresh et
+  // s'accumule au fil des imports successifs, comme le reste de l'app.
   const tableRecon = useMemo(() => {
     if (!debutFenetre) return {};
-    const lsIn = lsTransactions.filter(t => t.bdate >= debutFenetre && t.bdate < AUJOURDHUI);
-    const sunIn = sunTransactions.filter(t => t.bdate >= debutFenetre && t.bdate < AUJOURDHUI);
-    return reconcileTableAmounts(lsIn, sunIn);
-  }, [lsTransactions, sunTransactions, debutFenetre, AUJOURDHUI]);
+    const out = {};
+    tableReconRows.forEach(r => {
+      if (r.date < debutFenetre || r.date >= AUJOURDHUI) return;
+      out[r.date] = out[r.date] || {};
+      out[r.date][r.table] = { lsTotal: r.lsQR || 0, sunTotal: r.sunQR || 0 };
+    });
+    return out;
+  }, [tableReconRows, debutFenetre, AUJOURDHUI]);
 
   // Pourboires espèces cumulées JOUR PAR JOUR (données du formulaire de
   // clôture, colonne "Pourboires" = espèces comptées − fonds théorique,
@@ -1156,6 +1241,21 @@ function App() {
 
   const warnBox = importWarnings.length > 0 ? e("div", { style: S.warnBox },
     importWarnings.map((w, i) => e("div", { key: i, style: S.warnRow }, e(Icon, { name: "filewarning", size: 13 }), " ", w))
+  ) : null;
+
+  // Statut de sauvegarde du dernier import CSV vers le Sheet — remplace le
+  // fire-and-forget silencieux : Théo voit maintenant explicitement si
+  // l'import a bien été écrit, avec un bouton pour réessayer sinon.
+  const saveStatusBar = saveStatus ? e("div", {
+    style: {
+      display: "flex", alignItems: "center", gap: 8, borderRadius: 10, padding: "8px 14px", marginBottom: 14, fontSize: 13,
+      background: saveStatus.kind === "error" ? "#fbeae2" : saveStatus.kind === "ok" ? "#e6f4ec" : "#efe9df",
+      color: saveStatus.kind === "error" ? "#a3491f" : saveStatus.kind === "ok" ? "#2e6a4a" : "#8a7d70",
+    },
+  },
+    e(Icon, { name: saveStatus.kind === "error" ? "alert" : saveStatus.kind === "ok" ? "check" : "refresh", size: 14 }),
+    e("span", null, saveStatus.label),
+    saveStatus.retry ? e("button", { style: { ...S.chip, marginLeft: "auto", padding: "5px 12px" }, onClick: saveStatus.retry }, "Réessayer") : null
   ) : null;
 
   let body;
@@ -1523,7 +1623,7 @@ function App() {
   };
 
   return e(React.Fragment, null,
-    e("div", { style: S.page }, header, importBar, importHelp, warnBox, body),
+    e("div", { style: S.page }, header, importBar, importHelp, saveStatusBar, warnBox, body),
     e(AssistantBubble, { context: assistantContext, disabled: rows.length === 0 })
   );
 }
