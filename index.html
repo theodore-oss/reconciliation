@@ -911,9 +911,23 @@ function App() {
     // dépôt — 3e "poche" avec dépôt banque + pourboires caisse, qui doit
     // reboucler exactement sur les espèces collectées (cf. carte "Répartition").
     const fondsParallele = round2(depotTheorique - depotReel);
+    // Écarts de continuité : somme des (ouverture − esp. comptées la veille)
+    // pour chaque jour de la fenêtre — purement diagnostic, n'affecte PAS le
+    // dépôt théorique ni les pourboires caisse ci-dessus (deltaFonds ne
+    // dépend que des bornes fondsDebut/fondsFin, jamais des ouvertures
+    // intermédiaires). Sert à repérer un trou de saisie entre deux clôtures
+    // et à vérifier qu'il revient à 0 une fois corrigé.
+    let ecartsContinuiteTotal = 0, nbRupturesContinuite = 0;
+    fenetre.forEach(r => {
+      const veilleRow = rows.find(x => x.date === addDaysIso(r.date, -1));
+      if (!veilleRow) return;
+      const gap = round2((r.ouverture || 0) - (veilleRow.especesComptees || 0));
+      if (Math.abs(gap) > 0.01) { ecartsContinuiteTotal = round2(ecartsContinuiteTotal + gap); nbRupturesContinuite++; }
+    });
     return {
       caEsp, depenses, fondsDebut, fondsFin, deltaFonds, lsCB, sunCB, lsQR, sunQR, pbCB, pbEspDirect, misesCoffreTotal,
       pbCaisse, manquants, ecartCaisseNet, depotTheorique, depotReel, fondsParallele,
+      ecartsContinuiteTotal, nbRupturesContinuite,
       ecartCB: lsCB - sunCB, ecartQR: lsQR - sunQR,
       okCB: Math.abs(lsCB - sunCB) <= SEUIL, okQR: Math.abs(lsQR - sunQR) <= SEUIL,
       okEsp: Math.abs(ecartCaisseNet) <= 20,
@@ -1015,8 +1029,15 @@ function App() {
       : REPARTITION_HISTORIQUE.dateRepartition;
     const finCagnotte = addDaysIso(AUJOURDHUI, -1);
     const joursInclus = rows.filter(r => r.date >= dernierePartitionDate && r.date <= finCagnotte);
+    // Chaque jour contribue (esp. comptées − fonds théorique), mais fonds
+    // théorique inclut "ouverture" : une rupture de continuité (ouverture ≠
+    // esp. comptées la veille, cf. agg.ecartsContinuiteTotal) fausserait donc
+    // la cagnotte d'un montant qui n'est pas un vrai pourboire trouvé en
+    // caisse — on l'annule ici en rajoutant le gap avant de sommer.
     const cagnotte = round2(joursInclus.reduce((s, r) => {
-      const jour = round2((r.especesComptees || 0) - (r.fondsTheorique || 0));
+      const veilleRow = rows.find(x => x.date === addDaysIso(r.date, -1));
+      const gapContinuite = veilleRow ? round2((r.ouverture || 0) - (veilleRow.especesComptees || 0)) : 0;
+      const jour = round2((r.especesComptees || 0) - (r.fondsTheorique || 0) + gapContinuite);
       return s + (jour > 0 ? jour : 0);
     }, 0));
     const periodeDebut = dernierePartitionDate;
@@ -1219,6 +1240,14 @@ function App() {
             e("div", { style: S.tipRow }, e("span", null, "Fonds de caisse parallèle"), e("b", null, euro(agg.fondsParallele))),
             e("div", { style: { ...S.tipRow, borderTop: "1px solid #ece5dc", paddingTop: 10, marginTop: 4 } },
               e("span", { style: { fontWeight: 700 } }, "= Espèces collectées"), e("b", { style: { color: "#8B1A1A", fontSize: 17 } }, euro(agg.depotReel + agg.ecartCaisseNet + agg.fondsParallele))
+            ),
+            e("div", {
+              style: { ...S.tipRow, marginTop: 10, color: Math.abs(agg.ecartsContinuiteTotal) > 0.01 ? "#c25b3a" : "#a89b8d", fontSize: 12.5 },
+              title: agg.nbRupturesContinuite > 0
+                ? `${agg.nbRupturesContinuite} rupture(s) sur la fenêtre — corrige l'Ouverture surlignée en ambre dans l'onglet "jours" pour revenir à 0.`
+                : "Aucune rupture : chaque ouverture correspond bien aux espèces comptées la veille.",
+            },
+              e("span", null, "Écarts de continuité (hors sommes ci-dessus)"), e("b", null, euro(agg.ecartsContinuiteTotal))
             ),
             e("div", { style: { ...S.tipRow, marginTop: 6, color: "#a89b8d", fontSize: 12.5 } }, e("span", null, "Pourboires CB (à part)"), e("b", null, euro(agg.pbCB))),
             e("div", { style: { ...S.blockTitle, marginTop: 22 } }, e(Icon, { name: "calendar", size: 16 }), " Récap fenêtre"),
