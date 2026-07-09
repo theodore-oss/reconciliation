@@ -108,41 +108,51 @@ async function supprimerDernierDepotRequest() {
     return data || { status: "error" };
   } catch (err) { return { status: "error" }; }
 }
-async function importJournalierBulk(rows) {
+// GET/JSONP synchrone, PAS POST — un POST vers SCRIPT_URL sur ce déploiement
+// est redirigé (302) puis reconverti en GET par le navigateur, perdant le
+// body (donc l'action et les rows). Confirmé le 9/07 : le journal Apps
+// Script "Exécutions" ne montrait QUE des doGet après un import, jamais un
+// doPost, alors que l'app envoyait bien des requêtes POST — celles-ci
+// atterrissaient silencieusement sur la branche par défaut de doGet, sans
+// jamais rien écrire, d'où la sensation de devoir tout réimporter à chaque
+// fois. Même fix que ask_claude_sync (déjà en GET) : rows/payload passés en
+// paramètre JSON, comme les autres actions de l'app.
+//
+// Envoyé par lots (chunks) : une URL GET/JSONP a une limite de taille (côté
+// navigateur ET côté infra Google) — au-delà d'une certaine quantité de
+// lignes, la requête échoue silencieusement (le script ne charge jamais,
+// rien n'apparaît même dans le journal Exécutions puisqu'elle n'atteint
+// jamais le serveur). handleFile ne renvoie déjà que les dates du fichier
+// tout juste importé (pas tout l'historique), mais un import couvrant
+// beaucoup de jours/tables d'un coup pourrait quand même dépasser la
+// limite — le découpage par lots de ${CHUNK_SIZE} lignes s'en protège.
+const IMPORT_CHUNK_SIZE = 30;
+function chunkArray_(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+async function importBulkAction_(action, rows) {
   if (!SCRIPT_URL || rows.length === 0) return { ok: true };
   try {
-    const res = await fetch(SCRIPT_URL, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ rows, key: RECON_ACCESS_KEY }),
-    });
-    return { ok: res.ok };
+    for (const chunk of chunkArray_(rows, IMPORT_CHUNK_SIZE)) {
+      const url = `${SCRIPT_URL}?action=${action}&key=${encodeURIComponent(RECON_ACCESS_KEY)}&rows=${encodeURIComponent(JSON.stringify(chunk))}`;
+      const data = await withTimeout(jsonp(url), 20000);
+      if (!data || data.status !== "ok") return { ok: false };
+    }
+    return { ok: true };
   } catch (err) {
     return { ok: false, error: String(err) };
   }
 }
-async function importTableReconBulk(rows) {
-  if (!SCRIPT_URL || rows.length === 0) return { ok: true };
-  try {
-    const res = await fetch(SCRIPT_URL, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ action: "import_table_recon", rows, key: RECON_ACCESS_KEY }),
-    });
-    return { ok: res.ok };
-  } catch (err) {
-    return { ok: false, error: String(err) };
-  }
-}
+async function importJournalierBulk(rows) { return importBulkAction_("import_journalier", rows); }
+async function importTableReconBulk(rows) { return importBulkAction_("import_table_recon", rows); }
 const fetchRepartitions = fetchAction_("get_repartitions", []);
 async function validerRepartitionRequest(payload) {
   if (!SCRIPT_URL) return;
   try {
-    await fetch(SCRIPT_URL, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ action: "valider_repartition", key: RECON_ACCESS_KEY, ...payload }),
-    });
+    const url = `${SCRIPT_URL}?action=valider_repartition&key=${encodeURIComponent(RECON_ACCESS_KEY)}&payload=${encodeURIComponent(JSON.stringify(payload))}`;
+    await withTimeout(jsonp(url), 20000);
   } catch (err) {}
 }
 
@@ -892,7 +902,13 @@ function App() {
             // Sunday déjà connues pour ces tables).
             const lsTableRows = flattenTableRecon_(reconcileTableAmounts(transactions, []), "ls");
             setTableReconRows(prevTR => mergeTableReconRows(prevTR, lsTableRows));
-            saveImport(merged, file.name, lsTableRows);
+            // Ne renvoyer au Sheet QUE les dates de CE fichier, pas tout
+            // l'historique connu (merged contient TOUTES les dates jamais
+            // vues) — sinon la taille de l'URL GET/JSONP grossit à chaque
+            // import et finit par dépasser la limite (c'est ce qui causait
+            // les échecs de sauvegarde une fois l'historique un peu long).
+            const touchedDates = new Set(Object.keys(days));
+            saveImport(merged.filter(r => touchedDates.has(r.date)), file.name, lsTableRows);
             return merged;
           });
           if (Object.keys(stats.excludedTypeCounts).some(k => k.startsWith("UNKNOWN"))) {
@@ -915,7 +931,8 @@ function App() {
             const merged = mergeDaysToRows(extractLsDays(prev), result.days, prev);
             const sunTableRows = flattenTableRecon_(reconcileTableAmounts([], result.transactions || []), "sun");
             setTableReconRows(prevTR => mergeTableReconRows(prevTR, sunTableRows));
-            saveImport(merged, file.name, sunTableRows);
+            const touchedDates = new Set(Object.keys(result.days));
+            saveImport(merged.filter(r => touchedDates.has(r.date)), file.name, sunTableRows);
             return merged;
           });
         }
