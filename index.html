@@ -147,6 +147,7 @@ async function importBulkAction_(action, rows) {
 }
 async function importJournalierBulk(rows) { return importBulkAction_("import_journalier", rows); }
 async function importTableReconBulk(rows) { return importBulkAction_("import_table_recon", rows); }
+async function importTransactionsBulk(rows) { return importBulkAction_("import_transactions", rows); }
 const fetchRepartitions = fetchAction_("get_repartitions", []);
 async function validerRepartitionRequest(payload) {
   if (!SCRIPT_URL) return;
@@ -386,7 +387,7 @@ function parseLightspeedBuffer(arrayBuffer) {
     const time = `${pad2(dp.hour)}:${pad2(dp.minute)}`;
     const table = extractTableNumber(row.AccountName);
     if (type === "PAYMENT") {
-      byIdentifier[row.Identifier] = { bdate, time, table, staff: row.Staff || "", method, amount, voided: false };
+      byIdentifier[row.Identifier] = { id: row.Identifier, bdate, time, table, staff: row.Staff || "", method, amount, voided: false };
     } else if (type === "VOID") {
       const orig = byIdentifier[row.Reference];
       if (orig) orig.voided = true;
@@ -420,6 +421,14 @@ function parseSundayBuffer(arrayBuffer) {
   const statutCounts = {};
   const sourceCounts = {};
   const transactions = [];
+  // Sunday ne fournit pas d'identifiant unique par ligne (colonne "id" vide
+  // dans nos exports) — pour dédupliquer un réimport du même fichier sans
+  // écraser deux transactions distinctes ayant le même montant à la même
+  // minute (déjà observé : plusieurs paiements identiques coup sur coup sur
+  // une même table), on fabrique une clé composite incluant un rang
+  // d'occurrence (date|heure|méthode|montant|#n) — stable tant que le
+  // fichier réexporté garde le même ordre de lignes.
+  const occurrenceSeen = {};
   for (const row of parsed.data) {
     const statut = (row.Statut || "").trim();
     statutCounts[statut] = (statutCounts[statut] || 0) + 1;
@@ -436,10 +445,16 @@ function parseSundayBuffer(arrayBuffer) {
     const table = (row.id || "").trim() || null;
     if (source === "pay-at-table") {
       days[bdate].sunQR += sousTotal; days[bdate].pbQR += pourboire;
-      transactions.push({ bdate, time, table, method: "QR Code", amount: sousTotal, serveur: row.Serveur || "" });
+      const method = "QR Code";
+      const occKey = `${bdate}|${time}|${method}|${sousTotal}`;
+      const occ = (occurrenceSeen[occKey] = (occurrenceSeen[occKey] || 0) + 1);
+      transactions.push({ id: `${occKey}|${occ}`, bdate, time, table, method, amount: sousTotal, serveur: row.Serveur || "" });
     } else if (source === "pdq") {
       days[bdate].sunCB += sousTotal; days[bdate].pbCB += pourboire;
-      transactions.push({ bdate, time, table, method: "Carte bleue", amount: sousTotal, serveur: row.Serveur || "" });
+      const method = "Carte bleue";
+      const occKey = `${bdate}|${time}|${method}|${sousTotal}`;
+      const occ = (occurrenceSeen[occKey] = (occurrenceSeen[occKey] || 0) + 1);
+      transactions.push({ id: `${occKey}|${occ}`, bdate, time, table, method, amount: sousTotal, serveur: row.Serveur || "" });
     }
   }
   return { days, stats: { statutCounts, sourceCounts }, transactions };
@@ -714,6 +729,23 @@ function flattenTableRecon_(byDay, side) {
   return out;
 }
 
+// Aplati les transactions brutes (LS ou Sunday) en lignes persistables pour
+// la sheet "Transactions" — détail transaction par transaction, PAS agrégé,
+// pour que l'assistant Claude puisse expliquer un écart au niveau du
+// paiement individuel (cf. audit CB du 8 juillet : nécessite de voir quels
+// paiements précis manquent d'un côté, pas juste un total journalier).
+// source: "LS" ou "SUN" — préfixe le TxId pour éviter toute collision entre
+// les deux (l'Identifier Lightspeed et la clé composite Sunday vivent dans
+// des espaces de noms indépendants).
+function flattenTransactions_(transactions, source) {
+  return transactions.map(t => ({
+    date: t.bdate, heure: t.time, source,
+    methode: t.method, montant: round2(t.amount),
+    table: t.table || "", staff: t.staff || t.serveur || "",
+    txId: `${source}:${t.id}`,
+  }));
+}
+
 // Fusionne des lignes fraîchement calculées dans l'état local (persisté
 // côté Sheet) — même logique upsert-par-clé que côté backend, pour que
 // l'affichage reflète immédiatement l'import sans attendre le round-trip.
@@ -900,13 +932,13 @@ function App() {
   // Enregistrement explicite dans le Sheet après un import CSV, avec statut
   // visible (au lieu du fire-and-forget silencieux d'avant — Théo n'avait
   // aucun moyen de savoir si un import avait vraiment été sauvegardé).
-  const saveImport = useCallback((merged, label, tableRows = []) => {
+  const saveImport = useCallback((merged, label, tableRows = [], txRows = []) => {
     setSaveStatus({ kind: "saving", label: `Enregistrement (${label})…` });
-    Promise.all([importJournalierBulk(merged), importTableReconBulk(tableRows)]).then(([res, resTable]) => {
-      const ok = res.ok && resTable.ok;
+    Promise.all([importJournalierBulk(merged), importTableReconBulk(tableRows), importTransactionsBulk(txRows)]).then(([res, resTable, resTx]) => {
+      const ok = res.ok && resTable.ok && resTx.ok;
       setSaveStatus(ok
         ? { kind: "ok", label: `✓ ${label} sauvegardé dans le Sheet.` }
-        : { kind: "error", label: `✗ Échec de sauvegarde (${label}) — vérifie ta connexion et réessaie.`, retry: () => saveImport(merged, label, tableRows) });
+        : { kind: "error", label: `✗ Échec de sauvegarde (${label}) — vérifie ta connexion et réessaie.`, retry: () => saveImport(merged, label, tableRows, txRows) });
     });
   }, []);
 
@@ -933,13 +965,18 @@ function App() {
             // Sunday déjà connues pour ces tables).
             const lsTableRows = flattenTableRecon_(reconcileTableAmounts(transactions, []), "ls");
             setTableReconRows(prevTR => mergeTableReconRows(prevTR, lsTableRows));
+            // Détail transaction par transaction (toutes méthodes confondues,
+            // pas seulement QR/CB) — persisté pour que l'assistant Claude
+            // puisse expliquer un écart au niveau du paiement individuel
+            // plutôt qu'au seul total journalier (cf. audit CB du 8 juillet).
+            const lsTxRows = flattenTransactions_(transactions, "LS");
             // Ne renvoyer au Sheet QUE les dates de CE fichier, pas tout
             // l'historique connu (merged contient TOUTES les dates jamais
             // vues) — sinon la taille de l'URL GET/JSONP grossit à chaque
             // import et finit par dépasser la limite (c'est ce qui causait
             // les échecs de sauvegarde une fois l'historique un peu long).
             const touchedDates = new Set(Object.keys(days));
-            saveImport(merged.filter(r => touchedDates.has(r.date)), file.name, lsTableRows);
+            saveImport(merged.filter(r => touchedDates.has(r.date)), file.name, lsTableRows, lsTxRows);
             return merged;
           });
           if (Object.keys(stats.excludedTypeCounts).some(k => k.startsWith("UNKNOWN"))) {
@@ -968,8 +1005,9 @@ function App() {
             const merged = mergeDaysToRows(extractLsDays(prev), result.days, prev);
             const sunTableRows = flattenTableRecon_(reconcileTableAmounts([], result.transactions || []), "sun");
             setTableReconRows(prevTR => mergeTableReconRows(prevTR, sunTableRows));
+            const sunTxRows = flattenTransactions_(result.transactions || [], "SUN");
             const touchedDates = new Set(Object.keys(result.days));
-            saveImport(merged.filter(r => touchedDates.has(r.date)), file.name, sunTableRows);
+            saveImport(merged.filter(r => touchedDates.has(r.date)), file.name, sunTableRows, sunTxRows);
             return merged;
           });
         }
@@ -1699,7 +1737,7 @@ function App() {
         date: r.date, ouverture: r.ouverture, caEsp: r.caEsp, caCB: r.caCB, sunCB: r.sunCB, caQR: r.caQR, sunQR: r.sunQR,
         depenses: r.depenses, misesCoffre: r.misesCoffre, especesComptees: r.especesComptees,
         ecartCaisse: r.ecartCaisse, fonds: r.fonds, pbCB: r.pbCB, pbEspDirect: r.pbEspDirect,
-        ecartContinuite,
+        ecartContinuite, lsPostMinuitCB: r.lsPostMinuitCB || 0, lsPostMinuitQR: r.lsPostMinuitQR || 0,
       };
     }),
     ecartsParTable: Object.entries(tableRecon).flatMap(([date, tables]) =>
