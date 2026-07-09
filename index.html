@@ -1150,12 +1150,20 @@ function App() {
     // esp. comptées la veille, cf. agg.ecartsContinuiteTotal) fausserait donc
     // la cagnotte d'un montant qui n'est pas un vrai pourboire trouvé en
     // caisse — on l'annule ici en rajoutant le gap avant de sommer.
-    const cagnotte = round2(joursInclus.reduce((s, r) => {
+    // Somme des écarts signés (positifs ET négatifs), PAS un plafonnement à
+    // 0 jour par jour — un jour négatif doit bien réduire la cagnotte,
+    // sinon elle diverge de "Pourboire caisse" (carte Dépôt en cours), qui
+    // lui raisonne sur la somme nette de toute la fenêtre. Avec la
+    // correction de continuité ci-dessus, les deux méthodes sont
+    // mathématiquement identiques quand elles portent sur la même période.
+    // Seul le total final est plafonné à 0 (on ne "doit" jamais une
+    // cagnotte négative au personnel).
+    const cagnotte = Math.max(0, round2(joursInclus.reduce((s, r) => {
       const veilleRow = rows.find(x => x.date === addDaysIso(r.date, -1));
       const gapContinuite = veilleRow ? round2((r.ouverture || 0) - (veilleRow.especesComptees || 0)) : 0;
       const jour = round2((r.especesComptees || 0) - (r.fondsTheorique || 0) + gapContinuite);
-      return s + (jour > 0 ? jour : 0);
-    }, 0));
+      return s + jour;
+    }, 0)));
     const periodeDebut = dernierePartitionDate;
     const employesList = Object.entries(employesHeures).map(([matricule, v]) => ({ matricule, ...v }));
     const totalHeures = round2(employesList.reduce((s, emp) => s + emp.heures, 0));
