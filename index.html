@@ -17,7 +17,7 @@
 <div id="root">
   <div style="padding:60px;text-align:center;color:#8a7d70;font-family:sans-serif;">Chargement…</div>
 </div>
- 
+
 <!-- Aucune installation nécessaire : tout tourne dans le navigateur.
      React + le parseur CSV se chargent depuis un CDN au premier lancement
      (comme les polices Google ci-dessus) — pas de Babel/JSX ici, du
@@ -284,7 +284,7 @@ function todayIso() {
   const now = new Date();
   return isoDate(now.getFullYear(), now.getMonth() + 1, now.getDate());
 }
-function frDate(iso) { const [, m, d] = iso.split("-"); return `${d}/${m}`; }
+function frDate(iso) { if (!iso) return "—"; const [, m, d] = iso.split("-"); return `${d}/${m}`; }
 
 // ————————————————————————————————————————————————————————
 // Parsing Lightspeed (export détaillé par paiement)
