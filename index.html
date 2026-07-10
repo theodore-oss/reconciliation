@@ -570,7 +570,14 @@ function parseSkelloBuffer(arrayBuffer) {
 }
 
 function round2(n) { return Math.round((n + Number.EPSILON) * 100) / 100; }
-function extractLsDays(rows) { const out = {}; rows.forEach(r => out[r.date] = { caEsp: r.caEsp, caCB: r.caCB, caQR: r.caQR, lsPostMinuitCB: r.lsPostMinuitCB, lsPostMinuitQR: r.lsPostMinuitQR }); return out; }
+// r.caEspLS (pas r.caEsp !) : "caEsp" est la valeur AUTORITAIRE, sourcée de
+// Clôtures (jamais de Lightspeed, cf. applyFondCaisse_) — l'utiliser ici
+// mélangeait les deux et cassait le report de "Espèces LS" d'un import à
+// l'autre (elle retombait à 0 pour toute date pas couverte par le fichier
+// tout juste importé). caEspLS est la seule valeur qui doit alimenter ce
+// champ, cf. son propre bug de persistance réglé le 10/07 (colonne
+// LS_Especes ajoutée à Journalier côté Code.gs).
+function extractLsDays(rows) { const out = {}; rows.forEach(r => out[r.date] = { caEsp: r.caEspLS, caCB: r.caCB, caQR: r.caQR, lsPostMinuitCB: r.lsPostMinuitCB, lsPostMinuitQR: r.lsPostMinuitQR }); return out; }
 function extractSunDays(rows) { const out = {}; rows.forEach(r => out[r.date] = { sunCB: r.sunCB, sunQR: r.sunQR, pbCB: r.pbCB, pbQR: 0 }); return out; }
 function mergeDaysToRows(lsDays, sunDays, existingRows = []) {
   const existingByDate = Object.fromEntries(existingRows.map(r => [r.date, r]));
@@ -1652,7 +1659,15 @@ function App() {
             const deltaCell = (key, delta) => e("td", { key, style: { ...S.td, ...S.deltaCell, color: Math.abs(delta) > 0.01 ? "#b04040" : "#8a7d70" } }, euro(delta));
             // Lecture seule (Sheet autoritaire) : plus de onClick/input, juste
             // l'affichage — cf. editHint ci-dessus pour où corriger une valeur.
-            const staticCell = (champ, extraStyle, title) => e("td", { key: champ, title, style: { ...S.td, ...extraStyle } }, euro(r[champ]));
+            // "|| 0" nécessaire (pas juste cosmétique) : un jour dont le
+            // service n'est pas encore clôturé a une ligne Journalier (dès
+            // qu'un CSV a été importé) mais aucune ligne Clôtures — donc pas
+            // encore de valeur pour "ouverture"/"misesCoffre" (jamais
+            // renvoyés par getJournalierRows_, cf. Code.gs) tant que fc
+            // n'existe pas pour cette date. Sans le "|| 0" ici, r[champ]
+            // undefined → euro(undefined) → "NaN €" affiché (vu par Théo le
+            // 10/07 sur la ligne du jour en cours).
+            const staticCell = (champ, extraStyle, title) => e("td", { key: champ, title, style: { ...S.td, ...extraStyle } }, euro(r[champ] || 0));
             // Continuité de caisse : ouverture du jour vs espèces comptées la
             // veille — surbrillance ambre si rupture (erreur de saisie ou
             // mouvement non tracé entre les deux clôtures).
