@@ -132,9 +132,9 @@ function chunkArray_(arr, size) {
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
 }
-async function importBulkAction_(action, rows) {
+async function importBulkAction_(action, rows, chunkSize = IMPORT_CHUNK_SIZE) {
   if (!SCRIPT_URL || rows.length === 0) return { ok: true };
-  const chunks = chunkArray_(rows, IMPORT_CHUNK_SIZE);
+  const chunks = chunkArray_(rows, chunkSize);
   try {
     for (let i = 0; i < chunks.length; i++) {
       const url = `${SCRIPT_URL}?action=${action}&key=${encodeURIComponent(RECON_ACCESS_KEY)}&rows=${encodeURIComponent(JSON.stringify(chunks[i]))}`;
@@ -154,7 +154,14 @@ async function importBulkAction_(action, rows) {
 }
 async function importJournalierBulk(rows) { return importBulkAction_("import_journalier", rows); }
 async function importTableReconBulk(rows) { return importBulkAction_("import_table_recon", rows); }
-async function importTransactionsBulk(rows) { return importBulkAction_("import_transactions", rows); }
+// Lignes bien plus lourdes que les 2 imports ci-dessus (date, heure, source,
+// méthode, montant, table, staff, ET l'identifiant de dédup) — confirmé le
+// 10/07 : à 30 lignes/lot (IMPORT_CHUNK_SIZE), l'URL dépasse ce que l'infra
+// Google accepte et le lot est rejeté avant même d'atteindre doGet ("JSONP
+// request failed", pas une vraie erreur serveur). 10 lignes/lot reste large
+// (~3x moins que journalier/table pour un poids par ligne ~3x plus élevé).
+const TX_IMPORT_CHUNK_SIZE = 10;
+async function importTransactionsBulk(rows) { return importBulkAction_("import_transactions", rows, TX_IMPORT_CHUNK_SIZE); }
 const fetchRepartitions = fetchAction_("get_repartitions", []);
 async function validerRepartitionRequest(payload) {
   if (!SCRIPT_URL) return;
