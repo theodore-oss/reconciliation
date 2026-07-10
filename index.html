@@ -43,6 +43,12 @@ const e = React.createElement;
 // de clôture garde lui son propre déploiement en "Anyone" (staff sans
 // compte Google, juste le code PIN), sur le même script/Sheet.
 const SCRIPT_URL = "https://script.google.com/a/macros/grupodomingo.io/s/AKfycbxJTaRH3VkmOXGfornNZ4TNNjQWd4VcIc6gWwZxUJFReHJYstttakUSCdiA-CimpwWzJw/exec";
+// Lien direct vers l'onglet "Clôtures" du classeur (gid=1855935269) — pas
+// une action de l'app, juste un raccourci affiché dans "jours"/"Aide" pour
+// ouvrir le bon endroit où corriger ouverture/dépannage/mis au coffre/esp.
+// comptées. Accès Google (compte grupodomingo.io) requis, indépendant de
+// RECON_ACCESS_KEY.
+const CLOTURES_SHEET_URL = "https://docs.google.com/spreadsheets/d/1m7S6_CDQI4mHGVVY21U49OBSAn_nNJOjLVrPwLWIasU/edit?gid=1855935269#gid=1855935269";
 // Le déploiement Apps Script doit rester "Anyone" (nécessaire pour le JSONP
 // ci-dessous), donc cette clé sert de verrou minimal contre un accès direct
 // au Sheet par quelqu'un qui devine/scanne l'URL sans jamais avoir vu cette
@@ -1621,7 +1627,8 @@ function App() {
           e("div", { style: { display: "flex", alignItems: "center", gap: 7 } },
             e(Icon, { name: "lock", size: 13 }),
             e("span", null,
-              "Lecture seule — ", e("b", null, "Ouverture / CA espèces / Dépannage / Mis au coffre / Esp. comptées"), " → onglet Clôtures du Sheet · ",
+              "Lecture seule — ", e("b", null, "Ouverture / CA espèces / Dépannage / Mis au coffre / Esp. comptées"), " → ",
+              e("a", { href: CLOTURES_SHEET_URL, target: "_blank", rel: "noopener", style: { color: "#8B1A1A" } }, "onglet Clôtures du Sheet"), " · ",
               e("b", null, "CB/QR (LS & Sun.)"), " → réimport CSV en haut de page."
             )
           ),
@@ -1860,10 +1867,12 @@ function App() {
         ) : null
       );
     } else if (tab === "aide") {
-      const sourceRow = (champs, source, note) => e("div", { style: { ...S.tipRow, alignItems: "flex-start" } },
+      const sourceRow = (champs, source, note, url) => e("div", { style: { ...S.tipRow, alignItems: "flex-start" } },
         e("span", { style: { maxWidth: "58%" } }, champs),
         e("span", { style: { textAlign: "right" } },
-          e("b", { style: { color: "#8B1A1A" } }, source),
+          url
+            ? e("a", { href: url, target: "_blank", rel: "noopener", style: { fontWeight: 700, color: "#8B1A1A" } }, source)
+            : e("b", { style: { color: "#8B1A1A" } }, source),
           note ? e("div", { style: { fontSize: 11.5, color: "#a89b8d", marginTop: 2 } }, note) : null
         )
       );
@@ -1873,7 +1882,7 @@ function App() {
           e("div", { style: { fontSize: 12.5, color: "#8a7d70", marginBottom: 4 } },
             "L'onglet \"Détail jour par jour\" est en lecture seule : chaque champ n'a qu'un seul endroit où le corriger."
           ),
-          sourceRow("Ouverture, CA espèces, Dépannage, Mis au coffre, Esp. comptées", "Onglet Clôtures du Sheet", "Édite la ligne du service concerné, ou reclôture-le depuis caisse.grupodomingo.io. Éditer \"Journalier\" n'a aucun effet sur ces champs."),
+          sourceRow("Ouverture, CA espèces, Dépannage, Mis au coffre, Esp. comptées", "Onglet Clôtures du Sheet", "Édite la ligne du service concerné, ou reclôture-le depuis caisse.grupodomingo.io. Éditer \"Journalier\" n'a aucun effet sur ces champs.", CLOTURES_SHEET_URL),
           sourceRow("CB LS / QR LS, CB Sun. / QR Sun.", "Réimport CSV", "En haut de page (Lightspeed / Sunday). Éditer une cellule ne tient pas : le prochain import réécrase la valeur.")
         ),
         e("div", { style: S.card },
