@@ -1526,7 +1526,7 @@ function App() {
     );
 
     const tabs = e("div", { style: S.tabs },
-      [["courant", "Dépôt en cours"], ["jours", "Détail jour par jour"], ["table", "Par table"], ["historique", "Historique"], ["pourboires", "Pourboires"]].map(([k, l]) =>
+      [["courant", "Dépôt en cours"], ["jours", "Détail jour par jour"], ["table", "Par table"], ["historique", "Historique"], ["pourboires", "Pourboires"], ["aide", "Aide"]].map(([k, l]) =>
         e("button", { key: k, onClick: () => setTab(k), style: { ...S.tab, ...(tab === k ? S.tabActive : {}) } }, l)
       )
     );
@@ -1617,7 +1617,19 @@ function App() {
       );
     } else if (tab === "jours") {
       tabContent = e("div", { style: S.tableWrap },
-        e("div", { style: S.editHint }, e(Icon, { name: "lock", size: 13 }), ' Lecture seule — une seule source par champ. "Ouverture", "CA espèces", "Dépannage", "Mis au coffre" et "Esp. comptées" viennent du formulaire de clôture caisse.grupodomingo.io : pour corriger l\'une de ces valeurs, édite l\'onglet "Clôtures" du Sheet (ou reclôture le service) — éditer "Journalier" n\'a AUCUN effet sur ces 5 colonnes. "CB LS/QR LS" et "CB Sun./QR Sun." viennent des imports Lightspeed/Sunday : pour corriger, réimporte le bon CSV plutôt que d\'éditer une cellule (un futur import écraserait la correction). "Espèces LS" = référence indépendante Lightspeed ; "Δ Espèces" = écart avec "CA espèces" (contrôle croisé, comme Δ LS/Sun. pour CB/QR). Toutes les colonnes Δ sont en rouge si l\'écart est non nul. "Ouverture" en ambre = ne correspond pas aux espèces comptées la veille (rupture de continuité). "Fonds théo." = Ouverture + CA espèces − Dépannage − Mis au coffre. "Pourboires" = Esp. comptées − Fonds théo. (positif = pourboire caisse en vert, négatif = manquant en rouge). Les jours déjà déposés restent grisés. Jours du ' + frDate(HISTORIQUE_DEBUT) + ' à aujourd\'hui, les plus récents en haut.'),
+        e("div", { style: { ...S.editHint, justifyContent: "space-between" } },
+          e("div", { style: { display: "flex", alignItems: "center", gap: 7 } },
+            e(Icon, { name: "lock", size: 13 }),
+            e("span", null,
+              "Lecture seule — ", e("b", null, "Ouverture / CA espèces / Dépannage / Mis au coffre / Esp. comptées"), " → onglet Clôtures du Sheet · ",
+              e("b", null, "CB/QR (LS & Sun.)"), " → réimport CSV en haut de page."
+            )
+          ),
+          e("a", {
+            href: "#", onClick: ev => { ev.preventDefault(); setTab("aide"); },
+            style: { fontSize: 12.5, color: "#8B1A1A", whiteSpace: "nowrap", flexShrink: 0 }
+          }, "Détails & formules →")
+        ),
         e("table", { style: S.table },
           e("thead", null, e("tr", null, ["Date", "Ouverture", "CA espèces", "Espèces LS", "Δ Espèces", "CB LS", "CB Sun.", "Δ LS/Sun.", "QR LS", "QR Sun.", "Δ LS/Sun.", "Dépannage", "Mis au coffre", "Fonds théo.", "Esp. comptées", "Pourboires"].map(h => e("th", { key: h, style: S.th }, h)))),
           e("tbody", null, joursAffiches.map(r => {
@@ -1846,6 +1858,37 @@ function App() {
             )
           )
         ) : null
+      );
+    } else if (tab === "aide") {
+      const sourceRow = (champs, source, note) => e("div", { style: { ...S.tipRow, alignItems: "flex-start" } },
+        e("span", { style: { maxWidth: "58%" } }, champs),
+        e("span", { style: { textAlign: "right" } },
+          e("b", { style: { color: "#8B1A1A" } }, source),
+          note ? e("div", { style: { fontSize: 11.5, color: "#a89b8d", marginTop: 2 } }, note) : null
+        )
+      );
+      tabContent = e("div", { style: { display: "grid", gap: 14, maxWidth: 780 } },
+        e("div", { style: S.card },
+          e("div", { style: S.blockTitle }, e(Icon, { name: "lock", size: 16 }), " Une seule source par champ"),
+          e("div", { style: { fontSize: 12.5, color: "#8a7d70", marginBottom: 4 } },
+            "L'onglet \"Détail jour par jour\" est en lecture seule : chaque champ n'a qu'un seul endroit où le corriger."
+          ),
+          sourceRow("Ouverture, CA espèces, Dépannage, Mis au coffre, Esp. comptées", "Onglet Clôtures du Sheet", "Édite la ligne du service concerné, ou reclôture-le depuis caisse.grupodomingo.io. Éditer \"Journalier\" n'a aucun effet sur ces champs."),
+          sourceRow("CB LS / QR LS, CB Sun. / QR Sun.", "Réimport CSV", "En haut de page (Lightspeed / Sunday). Éditer une cellule ne tient pas : le prochain import réécrase la valeur.")
+        ),
+        e("div", { style: S.card },
+          e("div", { style: S.blockTitle }, e(Icon, { name: "alert", size: 16 }), " Légende & formules"),
+          e("div", { style: S.tipRow }, e("span", null, "Colonne Δ en rouge"), e("span", { style: { textAlign: "right", maxWidth: "58%" } }, "Écart non nul entre les deux sources comparées (ex. CA espèces vs Espèces LS)")),
+          e("div", { style: S.tipRow }, e("span", null, "Ouverture en ambre"), e("span", { style: { textAlign: "right", maxWidth: "58%" } }, "Rupture de continuité — ne correspond pas aux espèces comptées la veille")),
+          e("div", { style: S.tipRow }, e("span", null, "Ligne grisée"), e("span", { style: { textAlign: "right", maxWidth: "58%" } }, "Jour déjà inclus dans un dépôt validé")),
+          e("div", { style: { ...S.tipRow, borderTop: "1px solid #ece5dc", paddingTop: 10, marginTop: 4 } }, e("span", null, "Fonds théo."), e("span", { style: { textAlign: "right" } }, "Ouverture + CA espèces − Dépannage − Mis au coffre")),
+          e("div", { style: S.tipRow }, e("span", null, "Pourboires"), e("span", { style: { textAlign: "right", maxWidth: "58%" } }, "Esp. comptées − Fonds théo. (vert si positif = pourboire caisse, rouge si négatif = manquant)"))
+        ),
+        e("div", { style: S.card },
+          e("div", { style: S.blockTitle }, e(Icon, { name: "filedown", size: 16 }), " Où trouver les exports CSV"),
+          e("div", { style: S.tipRow }, e("span", null, "Lightspeed"), e("span", { style: { textAlign: "right" } }, "Tous les rapports > Paiements > Période personnalisée")),
+          e("div", { style: S.tipRow }, e("span", null, "Sunday"), e("span", { style: { textAlign: "right" } }, "Opérations > Paiements > Période personnalisée"))
+        )
       );
     }
 
