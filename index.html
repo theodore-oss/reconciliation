@@ -356,10 +356,16 @@ function normalizeMethod(raw) {
   return null;
 }
 function parseLightspeedDate(raw) {
-  const m = /^(\d{2})\/(\d{2})\/(\d{2})\s+(\d{2}):(\d{2})$/.exec((raw || "").trim());
+  // Lightspeed exporte tantôt l'année sur 2 chiffres ("06/07/26"), tantôt sur
+  // 4 ("06/07/2026") selon le type d'export — confirmé le 10/07 : un fichier
+  // à année 4 chiffres a fait échouer CHAQUE ligne silencieusement (aucune
+  // ne matchait l'ancienne regex à 2 chiffres stricts), vidant caCB/caQR
+  // sans le moindre avertissement. On accepte maintenant les deux formats.
+  const m = /^(\d{2})\/(\d{2})\/(\d{2}|\d{4})\s+(\d{2}):(\d{2})$/.exec((raw || "").trim());
   if (!m) return null;
   const [, dd, mm, yy, HH, MM] = m;
-  return { year: 2000 + Number(yy), month: Number(mm), day: Number(dd), hour: Number(HH), minute: Number(MM) };
+  const year = yy.length === 2 ? 2000 + Number(yy) : Number(yy);
+  return { year, month: Number(mm), day: Number(dd), hour: Number(HH), minute: Number(MM) };
 }
 function extractTableNumber(accountName) {
   if (!accountName) return null;
@@ -378,12 +384,19 @@ function parseLightspeedBuffer(arrayBuffer) {
   const excludedTypeCounts = {};
   const unmappedMethods = new Set();
   const byIdentifier = {};
+  // Compteur dédié aux dates illisibles (format inattendu) — distinct des
+  // exclusions "normales" (VOID, COMP...) ci-dessus, pour pouvoir avertir
+  // explicitement si TOUT le fichier échoue à ce stade plutôt que de laisser
+  // un import "réussir" en silence sans avoir rien importé (cf. bug du
+  // 10/07 : nouveau format d'année sur 4 chiffres, 0 avertissement, 0 ligne
+  // exploitée, caCB/caQR affichés à 0 sans qu'on comprenne pourquoi).
+  let datesIllisibles = 0;
   for (const row of parsed.data) {
     const type = (row.Type || "").trim();
     if (LS_EXCLUDED_TYPES.has(type)) { excludedTypeCounts[type] = (excludedTypeCounts[type] || 0) + 1; continue; }
     if (!LS_INCLUDED_TYPES.has(type)) { if (type) excludedTypeCounts[`UNKNOWN:${type}`] = (excludedTypeCounts[`UNKNOWN:${type}`] || 0) + 1; continue; }
     const dp = parseLightspeedDate(row.Date);
-    if (!dp) continue;
+    if (!dp) { datesIllisibles++; continue; }
     const bdate = businessDateFromParts(dp.year, dp.month, dp.day, dp.hour);
     const amount = parseFloat(row.Amount);
     if (Number.isNaN(amount)) continue;
@@ -414,7 +427,7 @@ function parseLightspeedBuffer(arrayBuffer) {
     }
   }
   const transactions = Object.values(byIdentifier).filter(t => !t.voided);
-  return { days, stats: { excludedTypeCounts, unmappedMethods: Array.from(unmappedMethods) }, transactions };
+  return { days, stats: { excludedTypeCounts, unmappedMethods: Array.from(unmappedMethods), datesIllisibles, totalLignes: parsed.data.length }, transactions };
 }
 
 // ————————————————————————————————————————————————————————
@@ -1022,6 +1035,16 @@ function App() {
           }
           if (stats.unmappedMethods.length) {
             setImportWarnings(w => [...w, `Lightspeed : méthode(s) non reconnue(s) : ${stats.unmappedMethods.join(", ")}.`]);
+          }
+          // Garde-fou contre un échec de parsing TOTAL et silencieux (cf. bug
+          // du 10/07 : nouveau format de date jamais vu, chaque ligne
+          // ignorée, import "réussi" en apparence mais 0 donnée exploitée,
+          // aucun avertissement déclenché par les deux checks ci-dessus). Si
+          // une part significative des lignes du fichier ont une date
+          // illisible, c'est presque toujours tout le fichier — un format
+          // d'export qui change n'affecte jamais que quelques lignes.
+          if (stats.totalLignes > 0 && stats.datesIllisibles / stats.totalLignes > 0.5) {
+            setImportWarnings(w => [...w, `Lightspeed : ${stats.datesIllisibles}/${stats.totalLignes} lignes de ${file.name} ont une date illisible (format inattendu) — probablement TOUT le fichier ignoré. Vérifie le format de la colonne "Date" (ex. "06/07/26 09:55" attendu) et préviens-moi si Lightspeed a changé son export.`]);
           }
           // Paiements après minuit (avant CUTOFF_HOUR) : plus d'avertissement
           // ponctuel ici — le montant est persisté par jour (lsPostMinuitCB/QR,
