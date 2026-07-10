@@ -1645,7 +1645,16 @@ function App() {
           }, "Détails & formules →")
         ),
         e("table", { style: S.table },
-          e("thead", null, e("tr", null, ["Date", "Ouverture", "CA espèces", "Espèces LS", "Δ Espèces", "CB LS", "CB Sun.", "Δ LS/Sun.", "QR LS", "QR Sun.", "Δ LS/Sun.", "Dépannage", "Mis au coffre", "Fonds théo.", "Esp. comptées", "Pourboires"].map(h => e("th", { key: h, style: S.th }, h)))),
+          // Deux en-têtes affichent le même texte "Δ LS/Sun." (delta CB et
+          // delta QR) — utiliser directement ce texte comme clé React (key:
+          // h) créait deux clés identiques dans la même liste. React exige
+          // des clés uniques ; deux clés dupliquées cassent sa réconciliation
+          // et peuvent faire "fuir" du contenu d'un rendu à l'autre en
+          // changeant d'onglet (vu par Théo le 10/07 : un en-tête "Δ LS/Sun."
+          // apparaissait dans le tableau de l'onglet "Historique", qui n'a
+          // pourtant aucune colonne de ce nom). Fix : clé = libellé + index,
+          // texte affiché inchangé.
+          e("thead", null, e("tr", null, ["Date", "Ouverture", "CA espèces", "Espèces LS", "Δ Espèces", "CB LS", "CB Sun.", "Δ LS/Sun.", "QR LS", "QR Sun.", "Δ LS/Sun.", "Dépannage", "Mis au coffre", "Fonds théo.", "Esp. comptées", "Pourboires"].map((h, i) => e("th", { key: h + i, style: S.th }, h)))),
           e("tbody", null, joursAffiches.map(r => {
             const inWindow = r.date >= debutFenetre && r.date <= finFenetre;
             const isToday = r.date === AUJOURDHUI;
