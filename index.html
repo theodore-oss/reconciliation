@@ -91,10 +91,22 @@ function serializeParams(obj) {
   Object.entries(obj).forEach(([k, v]) => { if (v !== undefined && v !== null) params.set(k, String(v)); });
   return params;
 }
-function saveJourFireAndForget(row) {
-  if (!SCRIPT_URL) return;
-  const params = serializeParams({ action: "save_jour", key: RECON_ACCESS_KEY, ...row });
-  fetch(`${SCRIPT_URL}?${params.toString()}`).catch(() => {});
+// Anciennement fetch() fire-and-forget avec .catch(()=>{}) qui avale TOUTE
+// erreur (réseau, CORS...) sans jamais rien dire à Théo — vu tout ce qu'on
+// vient de trouver aujourd'hui sur des écritures qui échouent en silence
+// (imports CSV), une édition manuelle dans l'onglet "jours" mérite la même
+// confiance que les imports : JSONP + confirmation visible (réutilise
+// saveStatus, cf. persistJour dans le composant principal).
+async function saveJourRequest(row) {
+  if (!SCRIPT_URL) return { ok: true };
+  try {
+    const params = serializeParams({ action: "save_jour", key: RECON_ACCESS_KEY, ...row });
+    const data = await withTimeout(jsonp(`${SCRIPT_URL}?${params.toString()}`), 15000);
+    if (!data || data.status !== "ok") return { ok: false, reason: (data && data.message) || "réponse invalide" };
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: String(err) };
+  }
 }
 async function validerDepotRequest(depot) {
   if (!SCRIPT_URL) return;
@@ -564,6 +576,15 @@ function parseSkelloBuffer(arrayBuffer) {
 }
 
 function round2(n) { return Math.round((n + Number.EPSILON) * 100) / 100; }
+// Accepte la virgule ET le point comme séparateur décimal (Number("12,50")
+// vaut NaN, donc silencieusement remis à 0 par le "|| 0" habituel — cassait
+// toute saisie en virgule dans l'onglet "jours", le format le plus naturel
+// en français).
+function parseDecimalInput_(val) {
+  if (typeof val === "number") return Number.isFinite(val) ? val : 0;
+  const n = parseFloat(String(val ?? "").trim().replace(",", "."));
+  return Number.isFinite(n) ? n : 0;
+}
 function extractLsDays(rows) { const out = {}; rows.forEach(r => out[r.date] = { caEsp: r.caEsp, caCB: r.caCB, caQR: r.caQR, lsPostMinuitCB: r.lsPostMinuitCB, lsPostMinuitQR: r.lsPostMinuitQR }); return out; }
 function extractSunDays(rows) { const out = {}; rows.forEach(r => out[r.date] = { sunCB: r.sunCB, sunQR: r.sunQR, pbCB: r.pbCB, pbQR: 0 }); return out; }
 function mergeDaysToRows(lsDays, sunDays, existingRows = []) {
@@ -1234,21 +1255,37 @@ function App() {
     ))
   ) : null;
 
+  // Enregistrement d'une édition manuelle (onglet "jours"), avec la même
+  // confirmation visible (bandeau saveStatus) que les imports CSV — extrait
+  // en fonction nommée pour que "Réessayer" puisse rejouer exactement le
+  // même envoi sans dupliquer la logique de statut.
+  const persistJour = useCallback((row) => {
+    setSaveStatus({ kind: "saving", label: `Enregistrement (${frDate(row.date)})…` });
+    saveJourRequest(row).then(res => {
+      setSaveStatus(res.ok
+        ? { kind: "ok", label: `✓ Modification du ${frDate(row.date)} sauvegardée dans le Sheet.` }
+        : { kind: "error", label: `✗ Échec de sauvegarde (${frDate(row.date)})${res.reason ? " — " + res.reason : ""}`, retry: () => persistJour(row) });
+    });
+  }, []);
   const updateCell = (date, champ, val) => setRows(rs => {
     const existe = rs.some(r => r.date === date);
+    // Accepte la virgule comme séparateur décimal (parseDecimalInput_),
+    // format le plus naturel en français — Number("12,50") valait NaN et
+    // retombait silencieusement à 0 avec l'ancien "Number(val) || 0".
+    const parsed = parseDecimalInput_(val);
     // Un jour affiché comme "vide" (pas encore de ligne côté Sheet, cf.
     // joursAffiches plus bas) peut être édité directement — on crée la
     // ligne à la volée plutôt que de perdre la saisie.
     const newRows = existe
-      ? rs.map(r => r.date === date ? { ...r, [champ]: Number(val) || 0 } : r)
+      ? rs.map(r => r.date === date ? { ...r, [champ]: parsed } : r)
       : [...rs, {
           date, caEsp: 0, caEspLS: 0, caCB: 0, caQR: 0, sunCB: 0, sunQR: 0, depenses: 0,
           especesComptees: 0, pbEspDirect: 0, pbCB: 0, fonds: 0, ouverture: 0, misesCoffre: 0, ecartCaisse: 0, fondsTheorique: 0,
           lsPostMinuitCB: 0, lsPostMinuitQR: 0,
-          [champ]: Number(val) || 0,
+          [champ]: parsed,
         }].sort((a, b) => a.date.localeCompare(b.date));
     const updated = newRows.find(r => r.date === date);
-    if (updated) saveJourFireAndForget(updated);
+    if (updated) persistJour(updated);
     return newRows;
   });
 
