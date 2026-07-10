@@ -1167,6 +1167,67 @@ function App() {
   }, [fenetre, rows, debutFenetre]);
 
   const globalOK = agg.okCB && agg.okQR;
+
+  // Encart d'alertes consolidé, visible en permanence sur la page (quel que
+  // soit l'onglet actif) — synthèse des 4 signaux déjà calculés ailleurs
+  // dans l'app (cartes CB/QR/Espèces, onglet jours) plutôt que de devoir les
+  // repérer un par un en naviguant. Demande explicite de Théo le 10/07.
+  const MANQUANT_SEUIL = 20; // même seuil que okEsp (carte Espèces)
+  const alertes = useMemo(() => {
+    const out = [];
+    if (!agg.okCB) {
+      out.push({
+        type: "ecart", titre: "Écart Carte bancaire", montant: agg.ecartCB,
+        detail: (agg.lsPostMinuitCB > 0.01)
+          ? `${euro(agg.lsPostMinuitCB)} de paiements Lightspeed après minuit sur la fenêtre pourraient expliquer une partie de l'écart (export Sunday possiblement incomplet).`
+          : null,
+      });
+    }
+    if (!agg.okQR) {
+      out.push({
+        type: "ecart", titre: "Écart QR Code", montant: agg.ecartQR,
+        detail: (agg.lsPostMinuitQR > 0.01)
+          ? `${euro(agg.lsPostMinuitQR)} de paiements Lightspeed après minuit sur la fenêtre pourraient expliquer une partie de l'écart (export Sunday possiblement incomplet).`
+          : null,
+      });
+    }
+    // Manquant en caisse : SEULEMENT le sens négatif (espèces collectées <
+    // dépôt théorique) — un écart positif, c'est juste des pourboires
+    // trouvés en caisse, pas un problème (cf. carte "Répartition").
+    if (agg.ecartCaisseNet < -MANQUANT_SEUIL) {
+      out.push({ type: "manquant", titre: "Manquant en caisse", montant: agg.ecartCaisseNet, detail: null });
+    }
+    // Ruptures de continuité, une entrée par jour concerné (pas juste le
+    // total agrégé) — même calcul que agg.ecartsContinuiteTotal mais
+    // détaillé jour par jour pour pouvoir dire LEQUEL corriger.
+    fenetre.forEach(r => {
+      const veilleRow = rows.find(x => x.date === addDaysIso(r.date, -1));
+      if (!veilleRow) return;
+      const gap = round2((r.ouverture || 0) - (veilleRow.especesComptees || 0));
+      if (Math.abs(gap) > 0.01) {
+        out.push({ type: "continuite", titre: `Rupture de continuité — ${frDate(r.date)}`, montant: gap, detail: "Ouverture ≠ espèces comptées la veille — corrige l'Ouverture surlignée en ambre dans l'onglet \"jours\"." });
+      }
+    });
+    // Jour sans aucun import CSV (LS et Sunday) — signale un import oublié,
+    // comme celui qu'on vient de rater avec le changement de format de date
+    // Lightspeed. Faux positif possible un jour de fermeture du resto.
+    fenetre.forEach(r => {
+      const vide = !(r.caCB || r.caQR || r.caEspLS || r.sunCB || r.sunQR);
+      if (vide) {
+        out.push({ type: "sansimport", titre: `Aucun import CSV — ${frDate(r.date)}`, montant: null, detail: "Ni Lightspeed ni Sunday n'ont de données ce jour-là dans la fenêtre — vérifie qu'un import n'a pas été oublié (sauf si le resto était fermé)." });
+      }
+    });
+    return out;
+  }, [agg, fenetre, rows]);
+
+  const alertesPanel = alertes.length > 0 ? e("div", { style: S.alertesPanel },
+    e("div", { style: S.alertesHead }, e(Icon, { name: "alert", size: 15 }), e("b", null, `${alertes.length} alerte(s) sur la fenêtre en cours`)),
+    alertes.map((a, i) => e("div", { key: i, style: S.alerteRow },
+      e("div", { style: S.alerteTitre }, a.titre, a.montant !== null ? e("b", { style: { marginLeft: 8 } }, euro(a.montant)) : null),
+      a.detail ? e("div", { style: S.alerteDetail }, a.detail) : null
+    ))
+  ) : null;
+
   const updateCell = (date, champ, val) => setRows(rs => {
     const existe = rs.some(r => r.date === date);
     // Un jour affiché comme "vide" (pas encore de ligne côté Sheet, cf.
@@ -1770,7 +1831,7 @@ function App() {
       );
     }
 
-    body = e(React.Fragment, null, windowBar, tabs, tabContent);
+    body = e(React.Fragment, null, windowBar, alertesPanel, tabs, tabContent);
   }
 
   // Contexte envoyé à l'assistant Claude : tout ce qui est visible dans la
@@ -1841,6 +1902,11 @@ const S = {
   seuilInfo: { fontSize: 12, color: "#8a7d70" },
   warnBox: { background: "#fbeae2", border: "1px solid #f0c9b4", borderRadius: 10, padding: "10px 14px", marginBottom: 14 },
   warnRow: { display: "flex", alignItems: "center", gap: 7, fontSize: 12.5, color: "#a3491f", padding: "3px 0" },
+  alertesPanel: { background: "#fdf6ee", border: "1px solid #ecd9b8", borderLeft: "3px solid #c25b3a", borderRadius: 10, padding: "12px 16px", marginBottom: 14 },
+  alertesHead: { display: "flex", alignItems: "center", gap: 8, color: "#a3491f", fontSize: 13.5, marginBottom: 8 },
+  alerteRow: { padding: "6px 0", borderTop: "1px solid #f0e2cc" },
+  alerteTitre: { fontSize: 13, color: "#5a4d40", fontWeight: 600 },
+  alerteDetail: { fontSize: 12, color: "#8a7d70", marginTop: 2, lineHeight: 1.5 },
   grid3: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 14 },
   card: { background: "#fff", borderRadius: 12, padding: 18, boxShadow: "0 1px 3px rgba(0,0,0,.04)" },
   cardHead: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 },
