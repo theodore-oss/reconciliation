@@ -91,23 +91,11 @@ function serializeParams(obj) {
   Object.entries(obj).forEach(([k, v]) => { if (v !== undefined && v !== null) params.set(k, String(v)); });
   return params;
 }
-// Anciennement fetch() fire-and-forget avec .catch(()=>{}) qui avale TOUTE
-// erreur (réseau, CORS...) sans jamais rien dire à Théo — vu tout ce qu'on
-// vient de trouver aujourd'hui sur des écritures qui échouent en silence
-// (imports CSV), une édition manuelle dans l'onglet "jours" mérite la même
-// confiance que les imports : JSONP + confirmation visible (réutilise
-// saveStatus, cf. persistJour dans le composant principal).
-async function saveJourRequest(row) {
-  if (!SCRIPT_URL) return { ok: true };
-  try {
-    const params = serializeParams({ action: "save_jour", key: RECON_ACCESS_KEY, ...row });
-    const data = await withTimeout(jsonp(`${SCRIPT_URL}?${params.toString()}`), 15000);
-    if (!data || data.status !== "ok") return { ok: false, reason: (data && data.message) || "réponse invalide" };
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, reason: String(err) };
-  }
-}
+// L'onglet "jours" est en lecture seule : le Sheet (nourri par le formulaire
+// de clôture + les imports CSV Lightspeed/Sunday) fait autorité. Toute
+// correction se fait directement dans le Sheet, pas dans l'app — donc plus
+// besoin d'un chemin d'écriture depuis cet onglet (voir persistJour/updateCell,
+// retirés du composant App).
 async function validerDepotRequest(depot) {
   if (!SCRIPT_URL) return;
   const params = serializeParams({ action: "valider_depot", key: RECON_ACCESS_KEY, ...depot });
@@ -576,15 +564,6 @@ function parseSkelloBuffer(arrayBuffer) {
 }
 
 function round2(n) { return Math.round((n + Number.EPSILON) * 100) / 100; }
-// Accepte la virgule ET le point comme séparateur décimal (Number("12,50")
-// vaut NaN, donc silencieusement remis à 0 par le "|| 0" habituel — cassait
-// toute saisie en virgule dans l'onglet "jours", le format le plus naturel
-// en français).
-function parseDecimalInput_(val) {
-  if (typeof val === "number") return Number.isFinite(val) ? val : 0;
-  const n = parseFloat(String(val ?? "").trim().replace(",", "."));
-  return Number.isFinite(n) ? n : 0;
-}
 function extractLsDays(rows) { const out = {}; rows.forEach(r => out[r.date] = { caEsp: r.caEsp, caCB: r.caCB, caQR: r.caQR, lsPostMinuitCB: r.lsPostMinuitCB, lsPostMinuitQR: r.lsPostMinuitQR }); return out; }
 function extractSunDays(rows) { const out = {}; rows.forEach(r => out[r.date] = { sunCB: r.sunCB, sunQR: r.sunQR, pbCB: r.pbCB, pbQR: 0 }); return out; }
 function mergeDaysToRows(lsDays, sunDays, existingRows = []) {
@@ -631,22 +610,37 @@ function mergeDaysToRows(lsDays, sunDays, existingRows = []) {
 // (remplis plus tard par l'import CSV, sans jamais écraser ce qui vient
 // d'ici).
 function applyFondCaisse_(r, fc) {
-  // Fonds de caisse théorique recalculé côté client (plutôt que de
-  // reprendre tel quel la colonne "Nouveau fonds théorique" de Clôtures,
-  // qui — sur une journée à 2 services — ne reflète que le dernier
-  // service) : ouverture du jour + CA espèces − dépannage − mises au
-  // coffre, cumulés sur la journée entière.
-  const fondsTheorique = round2((fc.ouverture || 0) + (fc.ventesEspeces || 0) - (fc.depannage || 0) - (fc.misesCoffre || 0));
+  // Décision Théo du 10/07 : UNE SEULE source par champ. "Clôtures" (nourri
+  // par le formulaire caisse.grupodomingo.io, lu ici via fc.*) fait autorité
+  // pour TOUTES les données de caisse — ouverture, dépannage, mis au coffre,
+  // espèces comptées — sans exception et sans copie qui pourrait diverger.
+  // Lightspeed/Sunday (mergeDaysToRows) font autorité pour les ventes par
+  // moyen de paiement (CB/QR) et les pourboires CB. Donc ici, plus de
+  // précédence "r.field || fc.field" : on ignore délibérément une éventuelle
+  // valeur déjà présente dans "r" (résidu d'une ancienne colonne Journalier,
+  // cf. HEADERS_JOURNALIER côté Code.gs) et on prend TOUJOURS fc.*.
+  // Pour corriger une valeur, il faut donc éditer "Clôtures" (ou soumettre à
+  // nouveau le formulaire de caisse) — jamais le Sheet Journalier.
+  //
+  // Historique : ce merge tourne à chaque fetch de fondCaisse (donc à chaque
+  // chargement de page). Il a d'abord écrasé ces champs inconditionnellement
+  // (bug initial, "la valeur revient quand je rafraîchis" du 10/07), puis on
+  // a ajouté une précédence Journalier>Clôtures pour fixer ça — mais cette
+  // précédence recréait exactement la duplication à deux endroits que Théo
+  // veut éviter. Solution finale : Clôtures reste la seule source, point.
+  const ouverture = fc.ouverture || 0;
+  const depenses = fc.depannage || 0;
+  const especesComptees = fc.especesComptees || 0;
+  const pbEspDirect = fc.pourboires || 0;
+  const caEsp = round2(fc.ventesEspeces || 0); // cf. caEspLS pour la référence Lightspeed (jamais utilisée dans les calculs)
+  const fondsTheorique = round2(ouverture + caEsp - depenses - (fc.misesCoffre || 0));
   return {
     ...r,
-    caEsp: round2(fc.ventesEspeces || 0), // "CA espèces" = théorique saisi au formulaire de clôture (pas Lightspeed, cf. caEspLS)
-    depenses: fc.depannage,
-    especesComptees: fc.especesComptees,
-    fonds: fc.especesComptees, // fond gardé pour le lendemain
-    pbEspDirect: fc.pourboires,
-    ouverture: fc.ouverture,
-    misesCoffre: fc.misesCoffre,
-    ecartCaisse: fc.ecartCaisse,
+    caEsp, depenses, especesComptees,
+    fonds: especesComptees, // fond gardé pour le lendemain
+    pbEspDirect, ouverture,
+    misesCoffre: fc.misesCoffre || 0,
+    ecartCaisse: fc.ecartCaisse || 0,
     fondsTheorique,
   };
 }
@@ -915,7 +909,6 @@ function AssistantBubble({ context, disabled }) {
 function App() {
   const [rows, setRows] = useState([]);
   const [tab, setTab] = useState("courant");
-  const [edit, setEdit] = useState(null);
   const [lsFileName, setLsFileName] = useState(null);
   const [sunFileName, setSunFileName] = useState(null);
   const [importWarnings, setImportWarnings] = useState([]);
@@ -1232,7 +1225,7 @@ function App() {
       if (!veilleRow) return;
       const gap = round2((r.ouverture || 0) - (veilleRow.especesComptees || 0));
       if (Math.abs(gap) > 0.01) {
-        out.push({ type: "continuite", titre: `Rupture de continuité — ${frDate(r.date)}`, montant: gap, detail: "Ouverture ≠ espèces comptées la veille — corrige l'Ouverture surlignée en ambre dans l'onglet \"jours\"." });
+        out.push({ type: "continuite", titre: `Rupture de continuité — ${frDate(r.date)}`, montant: gap, detail: "Ouverture ≠ espèces comptées la veille — repérable en ambre dans l'onglet \"jours\", à corriger dans l'onglet Clôtures du Sheet." });
       }
     });
     // Jour sans aucun import CSV (LS et Sunday) — signale un import oublié,
@@ -1255,39 +1248,13 @@ function App() {
     ))
   ) : null;
 
-  // Enregistrement d'une édition manuelle (onglet "jours"), avec la même
-  // confirmation visible (bandeau saveStatus) que les imports CSV — extrait
-  // en fonction nommée pour que "Réessayer" puisse rejouer exactement le
-  // même envoi sans dupliquer la logique de statut.
-  const persistJour = useCallback((row) => {
-    setSaveStatus({ kind: "saving", label: `Enregistrement (${frDate(row.date)})…` });
-    saveJourRequest(row).then(res => {
-      setSaveStatus(res.ok
-        ? { kind: "ok", label: `✓ Modification du ${frDate(row.date)} sauvegardée dans le Sheet.` }
-        : { kind: "error", label: `✗ Échec de sauvegarde (${frDate(row.date)})${res.reason ? " — " + res.reason : ""}`, retry: () => persistJour(row) });
-    });
-  }, []);
-  const updateCell = (date, champ, val) => setRows(rs => {
-    const existe = rs.some(r => r.date === date);
-    // Accepte la virgule comme séparateur décimal (parseDecimalInput_),
-    // format le plus naturel en français — Number("12,50") valait NaN et
-    // retombait silencieusement à 0 avec l'ancien "Number(val) || 0".
-    const parsed = parseDecimalInput_(val);
-    // Un jour affiché comme "vide" (pas encore de ligne côté Sheet, cf.
-    // joursAffiches plus bas) peut être édité directement — on crée la
-    // ligne à la volée plutôt que de perdre la saisie.
-    const newRows = existe
-      ? rs.map(r => r.date === date ? { ...r, [champ]: parsed } : r)
-      : [...rs, {
-          date, caEsp: 0, caEspLS: 0, caCB: 0, caQR: 0, sunCB: 0, sunQR: 0, depenses: 0,
-          especesComptees: 0, pbEspDirect: 0, pbCB: 0, fonds: 0, ouverture: 0, misesCoffre: 0, ecartCaisse: 0, fondsTheorique: 0,
-          lsPostMinuitCB: 0, lsPostMinuitQR: 0,
-          [champ]: parsed,
-        }].sort((a, b) => a.date.localeCompare(b.date));
-    const updated = newRows.find(r => r.date === date);
-    if (updated) persistJour(updated);
-    return newRows;
-  });
+  // L'onglet "jours" est en lecture seule (Sheet autoritaire, cf. décisions
+  // du 10/07) : plus de saisie manuelle depuis l'app, donc plus de
+  // persistJour/updateCell. Une seule source par champ (cf. applyFondCaisse_
+  // plus haut) : Ouverture/Dépenses/Esp. comptées/Mis au coffre se corrigent
+  // dans l'onglet "Clôtures" du Sheet (jamais dans "Journalier", qui n'a
+  // plus aucun effet dessus) ; CA CB/QR et Sunday CB/QR se corrigent en
+  // réimportant le bon CSV Lightspeed/Sunday.
 
   // Vue "jours" complète : tous les jours calendaires depuis HISTORIQUE_DEBUT
   // jusqu'à aujourd'hui, y compris ceux sans ligne côté Sheet (affichés à
@@ -1636,7 +1603,7 @@ function App() {
             e("div", {
               style: { ...S.tipRow, marginTop: 10, color: Math.abs(agg.ecartsContinuiteTotal) > 0.01 ? "#c25b3a" : "#a89b8d", fontSize: 12.5 },
               title: agg.nbRupturesContinuite > 0
-                ? `${agg.nbRupturesContinuite} rupture(s) sur la fenêtre — corrige l'Ouverture surlignée en ambre dans l'onglet "jours" pour revenir à 0.`
+                ? `${agg.nbRupturesContinuite} rupture(s) sur la fenêtre — repérable(s) en ambre dans l'onglet "jours", à corriger dans l'onglet Clôtures du Sheet pour revenir à 0.`
                 : "Aucune rupture : chaque ouverture correspond bien aux espèces comptées la veille.",
             },
               e("span", null, "Écarts de continuité (hors sommes ci-dessus)"), e("b", null, euro(agg.ecartsContinuiteTotal))
@@ -1650,7 +1617,7 @@ function App() {
       );
     } else if (tab === "jours") {
       tabContent = e("div", { style: S.tableWrap },
-        e("div", { style: S.editHint }, e(Icon, { name: "pencil", size: 13 }), ' Clique sur une valeur pour la corriger — tout se recalcule. "Ouverture", "CA espèces", "Dépannage", "Mis au coffre" et "Esp. comptées" viennent du formulaire de clôture caisse.grupodomingo.io (éditables ici en dépannage). "Espèces LS" = référence indépendante Lightspeed (jamais modifiée à la main) ; "Δ Espèces" = écart avec "CA espèces" (contrôle croisé, comme Δ LS/Sun. pour CB/QR). Toutes les colonnes Δ sont en rouge si l\'écart est non nul. "Ouverture" en ambre = ne correspond pas aux espèces comptées la veille (rupture de continuité). "Fonds théo." = Ouverture + CA espèces − Dépannage − Mis au coffre. "Pourboires" = Esp. comptées − Fonds théo. (positif = pourboire caisse en vert, négatif = manquant en rouge). Les jours déjà déposés restent grisés. Jours du ' + frDate(HISTORIQUE_DEBUT) + ' à aujourd\'hui, les plus récents en haut.'),
+        e("div", { style: S.editHint }, e(Icon, { name: "lock", size: 13 }), ' Lecture seule — une seule source par champ. "Ouverture", "CA espèces", "Dépannage", "Mis au coffre" et "Esp. comptées" viennent du formulaire de clôture caisse.grupodomingo.io : pour corriger l\'une de ces valeurs, édite l\'onglet "Clôtures" du Sheet (ou reclôture le service) — éditer "Journalier" n\'a AUCUN effet sur ces 5 colonnes. "CB LS/QR LS" et "CB Sun./QR Sun." viennent des imports Lightspeed/Sunday : pour corriger, réimporte le bon CSV plutôt que d\'éditer une cellule (un futur import écraserait la correction). "Espèces LS" = référence indépendante Lightspeed ; "Δ Espèces" = écart avec "CA espèces" (contrôle croisé, comme Δ LS/Sun. pour CB/QR). Toutes les colonnes Δ sont en rouge si l\'écart est non nul. "Ouverture" en ambre = ne correspond pas aux espèces comptées la veille (rupture de continuité). "Fonds théo." = Ouverture + CA espèces − Dépannage − Mis au coffre. "Pourboires" = Esp. comptées − Fonds théo. (positif = pourboire caisse en vert, négatif = manquant en rouge). Les jours déjà déposés restent grisés. Jours du ' + frDate(HISTORIQUE_DEBUT) + ' à aujourd\'hui, les plus récents en haut.'),
         e("table", { style: S.table },
           e("thead", null, e("tr", null, ["Date", "Ouverture", "CA espèces", "Espèces LS", "Δ Espèces", "CB LS", "CB Sun.", "Δ LS/Sun.", "QR LS", "QR Sun.", "Δ LS/Sun.", "Dépannage", "Mis au coffre", "Fonds théo.", "Esp. comptées", "Pourboires"].map(h => e("th", { key: h, style: S.th }, h)))),
           e("tbody", null, joursAffiches.map(r => {
@@ -1664,11 +1631,9 @@ function App() {
             // Surbrillance sobre commune à toutes les colonnes Δ, pour les
             // distinguer d'un coup d'œil comme un groupe "contrôle".
             const deltaCell = (key, delta) => e("td", { key, style: { ...S.td, ...S.deltaCell, color: Math.abs(delta) > 0.01 ? "#b04040" : "#8a7d70" } }, euro(delta));
-            const editableCell = (champ, extraStyle, title) => e("td", { key: champ, title, style: { ...S.tdEdit, ...extraStyle }, onClick: () => inWindow && setEdit({ date: r.date, champ }) },
-              edit && edit.date === r.date && edit.champ === champ
-                ? e("input", { autoFocus: true, defaultValue: r[champ], onBlur: ev => { updateCell(r.date, champ, ev.target.value); setEdit(null); }, onKeyDown: ev => ev.key === "Enter" && ev.target.blur(), style: S.cellInput })
-                : euro(r[champ])
-            );
+            // Lecture seule (Sheet autoritaire) : plus de onClick/input, juste
+            // l'affichage — cf. editHint ci-dessus pour où corriger une valeur.
+            const staticCell = (champ, extraStyle, title) => e("td", { key: champ, title, style: { ...S.td, ...extraStyle } }, euro(r[champ]));
             // Continuité de caisse : ouverture du jour vs espèces comptées la
             // veille — surbrillance ambre si rupture (erreur de saisie ou
             // mouvement non tracé entre les deux clôtures).
@@ -1676,19 +1641,19 @@ function App() {
             const ruptureContinuite = ecartContinuite !== null && Math.abs(ecartContinuite) > 0.01;
             return e("tr", { key: r.date, style: { background: isToday ? "#f3efe8" : deposited ? "#f4f1ec" : inWindow ? "#fff" : "#faf8f5", opacity: isToday || deposited ? 0.5 : 1 } },
               e("td", { style: { ...S.td, fontWeight: 700, textAlign: "left" } }, frDate(r.date)),
-              editableCell("ouverture", ruptureContinuite ? S.continuiteAlertCell : null,
+              staticCell("ouverture", ruptureContinuite ? S.continuiteAlertCell : null,
                 ruptureContinuite ? `Rupture de continuité : ${euro(Math.abs(ecartContinuite))} de ${ecartContinuite > 0 ? "plus" : "moins"} que les espèces comptées la veille.` : undefined),
-              editableCell("caEsp"),
+              staticCell("caEsp"),
               e("td", { style: S.td }, euro(r.caEspLS || 0)),
               deltaCell("deltaEsp", deltaEsp),
-              editableCell("caCB"), editableCell("sunCB"),
+              staticCell("caCB"), staticCell("sunCB"),
               deltaCell("deltaCB", deltaCB),
-              editableCell("caQR"), editableCell("sunQR"),
+              staticCell("caQR"), staticCell("sunQR"),
               deltaCell("deltaQR", deltaQR),
-              editableCell("depenses"),
-              editableCell("misesCoffre", S.misesCoffreCell),
+              staticCell("depenses"),
+              staticCell("misesCoffre", S.misesCoffreCell),
               e("td", { style: S.td }, euro(r.fondsTheorique || 0)),
-              editableCell("especesComptees"),
+              staticCell("especesComptees"),
               e("td", { style: { ...S.td, fontWeight: 700, color: pourboires > 0 ? "#3a7d5c" : pourboires < 0 ? "#b04040" : "#8a7d70" } }, euro(pourboires))
             );
           }))
@@ -1984,8 +1949,6 @@ const S = {
   table: { width: "100%", borderCollapse: "collapse", fontSize: 13 },
   th: { textAlign: "right", padding: "12px 10px", background: "#2f4a3a", color: "#e8f0ea", fontWeight: 600, whiteSpace: "nowrap", fontSize: 11.5 },
   td: { textAlign: "right", padding: "10px 10px", borderBottom: "1px solid #f0ebe4", whiteSpace: "nowrap" },
-  tdEdit: { textAlign: "right", padding: "10px 10px", borderBottom: "1px solid #f0ebe4", whiteSpace: "nowrap", cursor: "pointer" },
-  cellInput: { width: 58, padding: "4px 6px", border: "1px solid #8B1A1A", borderRadius: 5, fontFamily: "inherit", fontSize: 13, textAlign: "right" },
   // Colonnes Δ (contrôle croisé) : surbrillance sobre commune, pour les
   // repérer d'un coup d'œil sans être criarde.
   deltaCell: { background: "#f6f0e4" },
