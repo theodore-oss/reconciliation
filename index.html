@@ -938,14 +938,27 @@ function App() {
   // Enregistrement explicite dans le Sheet après un import CSV, avec statut
   // visible (au lieu du fire-and-forget silencieux d'avant — Théo n'avait
   // aucun moyen de savoir si un import avait vraiment été sauvegardé).
-  const saveImport = useCallback((merged, label, tableRows = [], txRows = []) => {
+  //
+  // Les 3 imports (journalier/table/transactions) sont envoyés l'UN APRÈS
+  // L'AUTRE, pas en parallèle (Promise.all) : upsertJournalierRow_,
+  // upsertTableReconRows_ ET upsertTransactionRows_ prennent tous les trois
+  // le MÊME LockService.getScriptLock() côté Code.gs (verrou global au
+  // script, pas par sheet). En parallèle, chacun des trois imports découpe
+  // en plus ses lignes en plusieurs lots séquentiels (cf. importBulkAction_)
+  // — avec 3 flux de lots qui se battent pour le même verrou en même temps
+  // (surtout "transactions", qui a le plus de lignes et donc le plus de
+  // lots), un lot fini par attendre le verrou plus de 30s et échoue avec
+  // "Échec de sauvegarde", même si les données finissent par être écrites
+  // ailleurs. Séquentiel = plus lent, mais plus aucune contention.
+  const saveImport = useCallback(async (merged, label, tableRows = [], txRows = []) => {
     setSaveStatus({ kind: "saving", label: `Enregistrement (${label})…` });
-    Promise.all([importJournalierBulk(merged), importTableReconBulk(tableRows), importTransactionsBulk(txRows)]).then(([res, resTable, resTx]) => {
-      const ok = res.ok && resTable.ok && resTx.ok;
-      setSaveStatus(ok
-        ? { kind: "ok", label: `✓ ${label} sauvegardé dans le Sheet.` }
-        : { kind: "error", label: `✗ Échec de sauvegarde (${label}) — vérifie ta connexion et réessaie.`, retry: () => saveImport(merged, label, tableRows, txRows) });
-    });
+    const res = await importJournalierBulk(merged);
+    const resTable = res.ok ? await importTableReconBulk(tableRows) : { ok: false };
+    const resTx = resTable.ok ? await importTransactionsBulk(txRows) : { ok: false };
+    const ok = res.ok && resTable.ok && resTx.ok;
+    setSaveStatus(ok
+      ? { kind: "ok", label: `✓ ${label} sauvegardé dans le Sheet.` }
+      : { kind: "error", label: `✗ Échec de sauvegarde (${label}) — vérifie ta connexion et réessaie.`, retry: () => saveImport(merged, label, tableRows, txRows) });
   }, []);
 
   const handleFile = useCallback((file, kind) => {
