@@ -801,7 +801,7 @@ function mergeTableReconRows(prev, newRows) {
 // ————————————————————————————————————————————————————————
 // Sous-composants
 // ————————————————————————————————————————————————————————
-function ReconCard({ icon, title, a, b, ecart, ok, note, warning }) {
+function ReconCard({ icon, title, a, b, ecart, ok, note, warning, ecartLabel = "ÉCART" }) {
   return e("div", { style: { ...S.card, borderTop: `3px solid ${ok ? "#3a7d5c" : "#c25b3a"}` } },
     e("div", { style: S.cardHead },
       e("div", { style: { display: "flex", alignItems: "center", gap: 8, color: "#5a4d40" } }, icon, e("b", null, title)),
@@ -810,7 +810,7 @@ function ReconCard({ icon, title, a, b, ecart, ok, note, warning }) {
     e("div", { style: S.cardRow }, e("span", null, a.label), e("b", null, euro(a.val))),
     e("div", { style: S.cardRow }, e("span", null, b.label), e("b", null, euro(b.val))),
     e("div", { style: S.ecartBox },
-      e("span", { style: { fontSize: 12, color: "#8a7d70" } }, "ÉCART"),
+      e("span", { style: { fontSize: 12, color: "#8a7d70" } }, ecartLabel),
       e("span", { style: { fontSize: 22, fontWeight: 800, color: ok ? "#3a7d5c" : "#c25b3a" } }, euro(ecart))
     ),
     e("div", { style: S.note }, note),
@@ -1162,7 +1162,13 @@ function App() {
       ecartsContinuiteTotal, nbRupturesContinuite, lsPostMinuitCB, lsPostMinuitQR,
       ecartCB: lsCB - sunCB, ecartQR: lsQR - sunQR,
       okCB: Math.abs(lsCB - sunCB) <= SEUIL, okQR: Math.abs(lsQR - sunQR) <= SEUIL,
-      okEsp: Math.abs(ecartCaisseNet) <= 20,
+      // Un écart POSITIF (espèces collectées > dépôt théorique) n'est jamais
+      // un problème — ce sont des pourboires trouvés en caisse, pas un
+      // manquant. Seul le sens négatif (< -20€) est signalé en rouge ; tout
+      // le reste (positif quel que soit le montant, ou petit négatif de
+      // rounding) reste vert. Cohérent avec MANQUANT_SEUIL utilisé plus bas
+      // dans l'encart d'alertes.
+      okEsp: ecartCaisseNet >= -20,
     };
   }, [fenetre, rows, debutFenetre]);
 
@@ -1525,7 +1531,17 @@ function App() {
     if (tab === "courant") {
       tabContent = e(React.Fragment, null,
         e("div", { style: S.grid3 },
-          e(ReconCard, { icon: e(Icon, { name: "coins", size: 18 }), title: "Espèces", a: { label: "Dépôt théorique (CA − dép. − Δ fonds)", val: agg.depotTheorique }, b: { label: "Espèces collectées (mises au coffre)", val: agg.misesCoffreTotal }, ecart: agg.ecartCaisseNet, ok: agg.okEsp, note: `Pourboire caisse (${euro(agg.pbCaisse)}) · Manquant (${euro(agg.manquants)}) — cf. onglet Pourboires` }),
+          e(ReconCard, {
+            icon: e(Icon, { name: "coins", size: 18 }), title: "Espèces",
+            a: { label: "Dépôt théorique (CA − dép. − Δ fonds)", val: agg.depotTheorique },
+            b: { label: "Espèces collectées (mises au coffre)", val: agg.misesCoffreTotal },
+            ecart: agg.ecartCaisseNet, ok: agg.okEsp,
+            // "Pourboires" quand positif (rien à signaler), "Manquant"
+            // quand négatif (le vrai problème) — plus juste que "ÉCART" qui
+            // sonnait comme un souci dans les deux cas.
+            ecartLabel: agg.ecartCaisseNet >= 0 ? "POURBOIRES" : "MANQUANT",
+            note: `Pourboire caisse (${euro(agg.pbCaisse)}) · Manquant (${euro(agg.manquants)}) — cf. onglet Pourboires`,
+          }),
           e(ReconCard, {
             icon: e(Icon, { name: "card", size: 18 }), title: "Carte bancaire",
             a: { label: "CB Lightspeed", val: agg.lsCB }, b: { label: "CB Sunday", val: agg.sunCB },
