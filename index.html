@@ -134,15 +134,22 @@ function chunkArray_(arr, size) {
 }
 async function importBulkAction_(action, rows) {
   if (!SCRIPT_URL || rows.length === 0) return { ok: true };
+  const chunks = chunkArray_(rows, IMPORT_CHUNK_SIZE);
   try {
-    for (const chunk of chunkArray_(rows, IMPORT_CHUNK_SIZE)) {
-      const url = `${SCRIPT_URL}?action=${action}&key=${encodeURIComponent(RECON_ACCESS_KEY)}&rows=${encodeURIComponent(JSON.stringify(chunk))}`;
+    for (let i = 0; i < chunks.length; i++) {
+      const url = `${SCRIPT_URL}?action=${action}&key=${encodeURIComponent(RECON_ACCESS_KEY)}&rows=${encodeURIComponent(JSON.stringify(chunks[i]))}`;
       const data = await withTimeout(jsonp(url), 20000);
-      if (!data || data.status !== "ok") return { ok: false };
+      // Détail du chunk qui échoue (index/total) + message serveur si présent
+      // (jsonOutput_ renvoie {status:'error', message:...} en cas d'exception
+      // côté Code.gs) — pour ne plus avoir à deviner depuis le journal
+      // Exécutions, qui ne montre pas l'action ni l'erreur exacte.
+      if (!data || data.status !== "ok") {
+        return { ok: false, reason: `${action} — lot ${i + 1}/${chunks.length} : ${(data && data.message) || "réponse invalide"}` };
+      }
     }
     return { ok: true };
   } catch (err) {
-    return { ok: false, error: String(err) };
+    return { ok: false, reason: `${action} : ${String(err)}` };
   }
 }
 async function importJournalierBulk(rows) { return importBulkAction_("import_journalier", rows); }
@@ -953,12 +960,17 @@ function App() {
   const saveImport = useCallback(async (merged, label, tableRows = [], txRows = []) => {
     setSaveStatus({ kind: "saving", label: `Enregistrement (${label})…` });
     const res = await importJournalierBulk(merged);
-    const resTable = res.ok ? await importTableReconBulk(tableRows) : { ok: false };
-    const resTx = resTable.ok ? await importTransactionsBulk(txRows) : { ok: false };
+    const resTable = res.ok ? await importTableReconBulk(tableRows) : { ok: false, reason: null };
+    const resTx = resTable.ok ? await importTransactionsBulk(txRows) : { ok: false, reason: null };
     const ok = res.ok && resTable.ok && resTx.ok;
+    // La raison précise (laquelle des 3 écritures a échoué, sur quel lot,
+    // avec quel message serveur) est maintenant affichée directement dans le
+    // bandeau — plus besoin de deviner depuis le journal Exécutions, qui ne
+    // montre ni l'action ni l'erreur.
+    const echec = !res.ok ? res : (!resTable.ok ? resTable : resTx);
     setSaveStatus(ok
       ? { kind: "ok", label: `✓ ${label} sauvegardé dans le Sheet.` }
-      : { kind: "error", label: `✗ Échec de sauvegarde (${label}) — vérifie ta connexion et réessaie.`, retry: () => saveImport(merged, label, tableRows, txRows) });
+      : { kind: "error", label: `✗ Échec de sauvegarde (${label})${echec.reason ? " — " + echec.reason : ""}`, retry: () => saveImport(merged, label, tableRows, txRows) });
   }, []);
 
   const handleFile = useCallback((file, kind) => {
