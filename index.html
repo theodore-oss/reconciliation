@@ -1946,16 +1946,33 @@ function App() {
     // n'a aucun moyen de voir une rupture de continuité entre la clôture
     // d'un jour et l'ouverture du lendemain (le trou qui explique l'écart
     // fenêtre vs somme des écarts jour par jour, cf. cas 06→07/07).
-    joursDetail: fenetre.map(r => {
-      const veilleRow = rows.find(x => x.date === addDaysIso(r.date, -1));
-      const ecartContinuite = veilleRow ? round2((r.ouverture || 0) - (veilleRow.especesComptees || 0)) : null;
-      return {
-        date: r.date, ouverture: r.ouverture, caEsp: r.caEsp, caCB: r.caCB, sunCB: r.sunCB, caQR: r.caQR, sunQR: r.sunQR,
-        depenses: r.depenses, misesCoffre: r.misesCoffre, especesComptees: r.especesComptees,
-        ecartCaisse: r.ecartCaisse, fonds: r.fonds, pbCB: r.pbCB, pbEspDirect: r.pbEspDirect,
-        ecartContinuite, lsPostMinuitCB: r.lsPostMinuitCB || 0, lsPostMinuitQR: r.lsPostMinuitQR || 0,
-      };
-    }),
+    //
+    // Plafonné à JOURS_DETAIL_MAX jours (les plus récents) : sans ça, une
+    // fenêtre large (ex. 101 jours le 11/07, quand l'historique des dépôts
+    // n'était temporairement plus chargé et que la borne basse par défaut
+    // retombait tout en haut de l'historique) fait dépasser la limite de
+    // taille d'URL du GET/JSONP — même bug que les imports CSV avant leur
+    // découpage en lots (cf. TX_IMPORT_CHUNK_SIZE côté Code.gs), sauf qu'ici
+    // la requête échoue INSTANTANÉMENT (constaté : (failed), 248ms, 0 kb
+    // dans l'onglet Réseau) au lieu de simplement timeout — trompeur, car le
+    // journal Apps Script "Exécutions" ne montre alors AUCUN appel (la
+    // requête n'atteint jamais le serveur), ce qui ressemble à tort à un
+    // problème de déploiement ou de lenteur du modèle.
+    joursDetail: (() => {
+      const JOURS_DETAIL_MAX = 60;
+      const source = fenetre.length > JOURS_DETAIL_MAX ? fenetre.slice(-JOURS_DETAIL_MAX) : fenetre;
+      return source.map(r => {
+        const veilleRow = rows.find(x => x.date === addDaysIso(r.date, -1));
+        const ecartContinuite = veilleRow ? round2((r.ouverture || 0) - (veilleRow.especesComptees || 0)) : null;
+        return {
+          date: r.date, ouverture: r.ouverture, caEsp: r.caEsp, caCB: r.caCB, sunCB: r.sunCB, caQR: r.caQR, sunQR: r.sunQR,
+          depenses: r.depenses, misesCoffre: r.misesCoffre, especesComptees: r.especesComptees,
+          ecartCaisse: r.ecartCaisse, fonds: r.fonds, pbCB: r.pbCB, pbEspDirect: r.pbEspDirect,
+          ecartContinuite, lsPostMinuitCB: r.lsPostMinuitCB || 0, lsPostMinuitQR: r.lsPostMinuitQR || 0,
+        };
+      });
+    })(),
+    joursDetailTronque: fenetre.length > 60,
     ecartsParTable: Object.entries(tableRecon).flatMap(([date, tables]) =>
       Object.entries(tables).flatMap(([table, x]) => {
         const out = [];
