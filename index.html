@@ -102,10 +102,26 @@ function serializeParams(obj) {
 // correction se fait directement dans le Sheet, pas dans l'app — donc plus
 // besoin d'un chemin d'écriture depuis cet onglet (voir persistJour/updateCell,
 // retirés du composant App).
+// Anciennement fetch() fire-and-forget avec erreur avalée en silence — même
+// classe de bug que saveJourRequest/importBulkAction_ avant leur conversion
+// en JSONP (cf. leurs commentaires) : sur ce déploiement, un fetch() dont on
+// n'exploite pas la réponse peut échouer silencieusement (redirection 302 +
+// CORS) sans qu'aucune erreur ne remonte, donc SANS écrire dans le Sheet —
+// mais handleValiderDepot mettait quand même à jour l'état local sans
+// vérifier, donnant l'illusion trompeuse que le dépôt était validé (grisé,
+// historique) alors qu'un rechargement de page faisait tout "revenir comme
+// avant" (constaté par Théo le 11/07, aucune ligne réellement écrite dans
+// l'onglet "Dépôts"). Fix : JSONP + statut réel, comme les autres écritures.
 async function validerDepotRequest(depot) {
-  if (!SCRIPT_URL) return;
-  const params = serializeParams({ action: "valider_depot", key: RECON_ACCESS_KEY, ...depot });
-  try { await fetch(`${SCRIPT_URL}?${params.toString()}`); } catch (err) {}
+  if (!SCRIPT_URL) return { ok: true };
+  try {
+    const params = serializeParams({ action: "valider_depot", key: RECON_ACCESS_KEY, ...depot });
+    const data = await withTimeout(jsonp(`${SCRIPT_URL}?${params.toString()}`), 15000);
+    if (!data || data.status !== "ok") return { ok: false, reason: (data && data.message) || "réponse invalide" };
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: String(err) };
+  }
 }
 async function supprimerDernierDepotRequest() {
   if (!SCRIPT_URL) return { status: "error" };
@@ -121,7 +137,7 @@ async function supprimerDernierDepotRequest() {
 // doPost, alors que l'app envoyait bien des requêtes POST — celles-ci
 // atterrissaient silencieusement sur la branche par défaut de doGet, sans
 // jamais rien écrire, d'où la sensation de devoir tout réimporter à chaque
-// fois. Même fix que ask_claude_sync (déjà en GET) : rows/payload passés en
+// fois. Même fix que assistant_ask_sync (déjà en GET) : rows/payload passés en
 // paramètre JSON, comme les autres actions de l'app.
 //
 // Envoyé par lots (chunks) : une URL GET/JSONP a une limite de taille (côté
@@ -169,12 +185,23 @@ async function importTableReconBulk(rows) { return importBulkAction_("import_tab
 const TX_IMPORT_CHUNK_SIZE = 10;
 async function importTransactionsBulk(rows) { return importBulkAction_("import_transactions", rows, TX_IMPORT_CHUNK_SIZE); }
 const fetchRepartitions = fetchAction_("get_repartitions", []);
+// Même bug que validerDepotRequest (cf. son commentaire) trouvé le 11/07 en
+// auditant le même type d'action "valider X" : ici le transport était déjà
+// en JSONP (donc plus fiable qu'un fetch() nu), mais le statut de la
+// réponse n'était jamais vérifié (catch vide, résultat ignoré) — une
+// requête qui échoue silencieusement (timeout, erreur serveur) laissait
+// quand même handleValiderRepartition mettre à jour l'état local comme si
+// le versement avait été enregistré.
 async function validerRepartitionRequest(payload) {
-  if (!SCRIPT_URL) return;
+  if (!SCRIPT_URL) return { ok: true };
   try {
     const url = `${SCRIPT_URL}?action=valider_repartition&key=${encodeURIComponent(RECON_ACCESS_KEY)}&payload=${encodeURIComponent(JSON.stringify(payload))}`;
-    await withTimeout(jsonp(url), 20000);
-  } catch (err) {}
+    const data = await withTimeout(jsonp(url), 20000);
+    if (!data || data.status !== "ok") return { ok: false, reason: (data && data.message) || "réponse invalide" };
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: String(err) };
+  }
 }
 
 // Assistant Claude : on avait initialement envoyé la question en POST
@@ -200,8 +227,18 @@ async function askClaudeRequest(question, context, history) {
   if (!SCRIPT_URL) return "Assistant indisponible : Google Sheets n'est pas connecté.";
   // Historique tronqué (6 derniers messages) pour garder une URL raisonnable.
   const trimmedHistory = (history || []).slice(-6);
+  // Action renommée de "ask_claude_sync" à "assistant_ask_sync" le 11/07 :
+  // la requête échouait INSTANTANÉMENT ((failed), 0 kb, ~250ms dans l'onglet
+  // Réseau) quelle que soit la taille du payload (testé avec joursDetail
+  // filtré à presque rien, historique de conversation vide, ET en navigation
+  // privée) — seul point commun restant : le mot "claude" dans l'URL.
+  // Hypothèse retenue : un filtrage réseau (proxy/sécurité d'entreprise, pas
+  // une extension navigateur vu que la navigation privée ne change rien) qui
+  // bloque les requêtes vers des outils IA reconnus par mot-clé dans l'URL,
+  // indépendamment du domaine (script.google.com n'est pourtant pas un
+  // domaine IA). À confirmer si ce renommage résout le problème.
   const params = serializeParams({
-    action: "ask_claude_sync",
+    action: "assistant_ask_sync",
     key: RECON_ACCESS_KEY,
     question,
     context: JSON.stringify(context || {}),
@@ -216,9 +253,9 @@ async function askClaudeRequest(question, context, history) {
     // cas, mais on garde une marge large plutôt que de couper trop court.
     const data = await withTimeout(jsonp(`${SCRIPT_URL}?${params.toString()}`), 90000);
     if (data && data.status === "ok" && data.answer !== undefined) return data.answer;
-    return "Réponse inattendue de l'assistant. Vérifie dans Apps Script (menu \"Exécutions\") l'appel ask_claude_sync le plus récent pour voir l'erreur exacte.";
+    return "Réponse inattendue de l'assistant. Vérifie dans Apps Script (menu \"Exécutions\") l'appel assistant_ask_sync le plus récent pour voir l'erreur exacte.";
   } catch (err) {
-    return "L'assistant n'a pas répondu à temps (>90s). Vérifie dans l'éditeur Apps Script (menu \"Exécutions\") qu'un appel ask_claude_sync apparaît bien : aucun appel → redéploie (Gérer les déploiements > crayon > Nouvelle version) ; un appel en erreur → regarde le message affiché (souvent ANTHROPIC_API_KEY manquante).";
+    return "L'assistant n'a pas répondu à temps (>90s). Vérifie dans l'éditeur Apps Script (menu \"Exécutions\") qu'un appel assistant_ask_sync apparaît bien : aucun appel → redéploie (Gérer les déploiements > crayon > Nouvelle version) ; un appel en erreur → regarde le message affiché (souvent ANTHROPIC_API_KEY manquante).";
   }
 }
 
@@ -1295,7 +1332,30 @@ function App() {
     return withContinuite.reverse();
   }, [rows, AUJOURDHUI]);
 
-  const handleValiderDepot = async () => {
+  // L'état local (setDepots/setDebutCycle/setFinCycle, qui grise les jours
+  // et alimente l'Historique) ne doit être mis à jour que si l'écriture dans
+  // le Sheet a RÉELLEMENT réussi — sinon un rechargement de page fait tout
+  // "revenir comme avant" puisque le dépôt n'a en fait jamais été écrit
+  // (cf. commentaire sur validerDepotRequest). Même bandeau saveStatus que
+  // les imports CSV, avec un bouton Réessayer en cas d'échec.
+  const persistDepot = useCallback((depot) => {
+    setSaveStatus({ kind: "saving", label: `Enregistrement du dépôt du ${frDate(depot.dateDepot)}…` });
+    validerDepotRequest(depot).then(res => {
+      if (res.ok) {
+        setSaveStatus({ kind: "ok", label: `✓ Dépôt du ${frDate(depot.dateDepot)} sauvegardé dans le Sheet.` });
+        setDepots(prev => [...prev, depot]);
+        setDebutCycle(depot.dateDepot);
+        setFinCycle(null);
+      } else {
+        setSaveStatus({
+          kind: "error",
+          label: `✗ Échec de sauvegarde (dépôt du ${frDate(depot.dateDepot)})${res.reason ? " — " + res.reason : ""}`,
+          retry: () => persistDepot(depot),
+        });
+      }
+    });
+  }, []);
+  const handleValiderDepot = () => {
     if (!window.confirm(`Valider le dépôt du ${frDate(AUJOURDHUI)} pour ${euro(agg.depotReel)} ? Ça fige la fenêtre ${frDate(debutFenetre)}→${frDate(finFenetre)} dans l'historique.`)) return;
     const depot = {
       dateDepot: AUJOURDHUI, periodeDebut: debutFenetre, periodeFin: finFenetre,
@@ -1303,10 +1363,7 @@ function App() {
       pbCaisse: agg.pbCaisse, pbEspDirect: agg.pbEspDirect, pbCB: agg.pbCB, manquants: agg.manquants,
       caEsp: agg.caEsp, depenses: agg.depenses, deltaCaisse: agg.deltaFonds, especesCollectees: agg.misesCoffreTotal,
     };
-    await validerDepotRequest(depot);
-    setDepots(prev => [...prev, depot]);
-    setDebutCycle(AUJOURDHUI);
-    setFinCycle(null);
+    persistDepot(depot);
   };
 
   // Annule le dernier dépôt validé (erreur de saisie) — la fenêtre à
@@ -1384,7 +1441,30 @@ function App() {
     return { dernierePartitionDate, joursInclus, cagnotte, periodeDebut, periodeFin: finCagnotte, employesAvecPart, totalHeures, totalReparti };
   }, [repartitions, rows, employesHeures, AUJOURDHUI]);
 
-  const handleValiderRepartition = async () => {
+  // Même principe que persistDepot : l'état local (setRepartitions, qui
+  // remet la cagnotte à zéro et alimente l'Historique pourboires) n'est
+  // appliqué que si l'écriture a réellement réussi, avec bandeau + retry
+  // sinon — pour ne pas perdre silencieusement un versement.
+  const persistRepartition = useCallback((payload) => {
+    setSaveStatus({ kind: "saving", label: `Enregistrement du versement du ${frDate(payload.dateRepartition)}…` });
+    validerRepartitionRequest(payload).then(res => {
+      if (res.ok) {
+        setSaveStatus({ kind: "ok", label: `✓ Versement du ${frDate(payload.dateRepartition)} sauvegardé dans le Sheet.` });
+        setRepartitions(prev => [
+          ...prev,
+          ...payload.employes.map(emp => ({ dateRepartition: payload.dateRepartition, periodeDebut: payload.periodeDebut, periodeFin: payload.periodeFin, ...emp })),
+        ]);
+        resetSkelloImport();
+      } else {
+        setSaveStatus({
+          kind: "error",
+          label: `✗ Échec de sauvegarde (versement du ${frDate(payload.dateRepartition)})${res.reason ? " — " + res.reason : ""}`,
+          retry: () => persistRepartition(payload),
+        });
+      }
+    });
+  }, []);
+  const handleValiderRepartition = () => {
     const { cagnotte, periodeDebut, periodeFin, employesAvecPart } = repartitionCalc;
     if (employesAvecPart.length === 0) { window.alert("Importe au moins un fichier Skello avant de valider."); return; }
     if (!window.confirm(`Valider le versement de ${euro0(cagnotte)} entre ${employesAvecPart.length} employé(s) ? Ça fige la période ${frDate(periodeDebut)}→${frDate(periodeFin)} dans l'historique. La cagnotte repart ensuite de zéro.`)) return;
@@ -1394,12 +1474,7 @@ function App() {
       periodeFin,
       employes: employesAvecPart,
     };
-    await validerRepartitionRequest(payload);
-    setRepartitions(prev => [
-      ...prev,
-      ...employesAvecPart.map(emp => ({ dateRepartition: payload.dateRepartition, periodeDebut: payload.periodeDebut, periodeFin: payload.periodeFin, ...emp })),
-    ]);
-    resetSkelloImport();
+    persistRepartition(payload);
   };
 
   // Historique des versements groupé par date de versement (un versement =
