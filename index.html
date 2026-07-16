@@ -1194,7 +1194,13 @@ function App() {
     const misesCoffreTotal = sum("misesCoffre"); // espèces réellement collectées (mises au coffre)
     const veille = debutFenetre ? addDaysIso(debutFenetre, -1) : null;
     const rowFondsDebut = rows.find(r => r.date === veille);
-    const rowFondsFin = fenetre.length ? fenetre[fenetre.length - 1] : null;
+    // Si la fenêtre est vide (aucun jour clôturé pris en compte pour l'instant,
+    // p. ex. juste après l'ouverture d'une nouvelle période, aujourd'hui exclu
+    // par défaut), il n'y a encore rien à réconcilier : on retombe sur la même
+    // valeur qu'en début de fenêtre plutôt que 0, sinon Δ fonds de caisse
+    // fabrique un écart fictif (fondsDebut − 0) qui n'a aucun sens tant qu'aucun
+    // jour n'a été clôturé dans la nouvelle période.
+    const rowFondsFin = fenetre.length ? fenetre[fenetre.length - 1] : rowFondsDebut;
     const fondsDebut = rowFondsDebut ? rowFondsDebut.fonds : 0;
     const fondsFin = rowFondsFin ? rowFondsFin.fonds : 0;
     const deltaFonds = fondsFin - fondsDebut; // Δ fonds de caisse (fin − début de la fenêtre)
