@@ -1932,6 +1932,56 @@ function App() {
   // fenêtre en cours (détail jour par jour + écarts par table non-nuls +
   // totaux agrégés), pour qu'il puisse pointer une date/table précise sans
   // que Théo ait à tout recopier lui-même.
+  //
+  // ouverture + ecartContinuite inclus explicitement dans joursDetail : sans
+  // ça l'assistant n'a aucun moyen de voir une rupture de continuité entre
+  // la clôture d'un jour et l'ouverture du lendemain (le trou qui explique
+  // l'écart fenêtre vs somme des écarts jour par jour, cf. cas 06→07/07).
+  //
+  // 11/07 : un plafond à 60 jours "les plus récents" ne suffisait PAS —
+  // vérifié dans l'onglet Réseau, une fenêtre de SEULEMENT 10 jours
+  // produisait déjà une URL de plusieurs Ko rien qu'avec joursDetail (15
+  // champs/jour, verbeux une fois en JSON + URL-encodé — chaque `"`, `,`,
+  // `:` devient %XX, ~×3), assez pour échouer INSTANTANÉMENT (constaté :
+  // (failed), 0 kb, ~250ms) — testé aussi en navigation privée et avec un
+  // historique de conversation vide, donc ni les extensions ni
+  // l'accumulation de messages n'étaient en cause. Le vrai problème : la
+  // limite d'URL du GET/JSONP est plus basse qu'on ne pensait, et envoyer
+  // TOUS les jours de la fenêtre (même ceux parfaitement équilibrés, sans
+  // aucun intérêt pour expliquer un écart) était le vrai gaspillage.
+  //
+  // Fix : même philosophie que le détail transactionnel côté Code.gs
+  // (getTransactionsForDates_, limité aux dates avec écart CB/QR) — on
+  // n'envoie que les jours avec un signal réel (écart CB/QR/espèces au-delà
+  // de SEUIL, ou rupture de continuité), plus les JOURS_RECENTS_MIN derniers
+  // jours de la fenêtre dans tous les cas (pour qu'une question générale sur
+  // "hier" ait toujours une réponse même sans écart). Sur une fenêtre sans
+  // aucun problème, ça réduit le payload à presque rien au lieu d'un jour
+  // par jour complet.
+  const JOURS_RECENTS_MIN = 5;
+  const JOURS_DETAIL_MAX = 25; // garde-fou dur, même si beaucoup de jours sont flagués
+  const joursRecentsSet = new Set(fenetre.slice(-JOURS_RECENTS_MIN).map(r => r.date));
+  const joursSignificatifs = fenetre.filter(r => {
+    const ecartCB = Math.abs((r.caCB || 0) - (r.sunCB || 0));
+    const ecartQR = Math.abs((r.caQR || 0) - (r.sunQR || 0));
+    const ecartEsp = Math.abs((r.caEsp || 0) - (r.caEspLS || 0));
+    return ecartCB > SEUIL || ecartQR > SEUIL || ecartEsp > SEUIL || joursRecentsSet.has(r.date);
+  });
+  const joursDetailTronque = joursSignificatifs.length > JOURS_DETAIL_MAX;
+  const joursDetailSource = joursDetailTronque ? joursSignificatifs.slice(-JOURS_DETAIL_MAX) : joursSignificatifs;
+  const joursDetailBuilt = joursDetailSource.map(r => {
+    const veilleRow = rows.find(x => x.date === addDaysIso(r.date, -1));
+    const ecartContinuite = veilleRow ? round2((r.ouverture || 0) - (veilleRow.especesComptees || 0)) : null;
+    // Champs réduits à l'essentiel pour expliquer un écart CB/QR/espèces
+    // (depenses/misesCoffre/ecartCaisse/fonds/pbCB/pbEspDirect retirés :
+    // déjà dans "totaux" en agrégé, pas utiles jour par jour pour ce genre
+    // de question et ça pesait pour rien dans l'URL).
+    return {
+      date: r.date, ouverture: r.ouverture, caEsp: r.caEsp, caEspLS: r.caEspLS,
+      caCB: r.caCB, sunCB: r.sunCB, caQR: r.caQR, sunQR: r.sunQR, especesComptees: r.especesComptees,
+      ecartContinuite, lsPostMinuitCB: r.lsPostMinuitCB || 0, lsPostMinuitQR: r.lsPostMinuitQR || 0,
+    };
+  });
   const assistantContext = {
     periode: { debut: debutFenetre, fin: finFenetre, joursCount: fenetre.length },
     totaux: rows.length ? {
@@ -1942,37 +1992,8 @@ function App() {
       lsCB: agg.lsCB, sunCB: agg.sunCB, ecartCB: agg.ecartCB,
       lsQR: agg.lsQR, sunQR: agg.sunQR, ecartQR: agg.ecartQR,
     } : null,
-    // ouverture + ecartContinuite inclus explicitement : sans ça l'assistant
-    // n'a aucun moyen de voir une rupture de continuité entre la clôture
-    // d'un jour et l'ouverture du lendemain (le trou qui explique l'écart
-    // fenêtre vs somme des écarts jour par jour, cf. cas 06→07/07).
-    //
-    // Plafonné à JOURS_DETAIL_MAX jours (les plus récents) : sans ça, une
-    // fenêtre large (ex. 101 jours le 11/07, quand l'historique des dépôts
-    // n'était temporairement plus chargé et que la borne basse par défaut
-    // retombait tout en haut de l'historique) fait dépasser la limite de
-    // taille d'URL du GET/JSONP — même bug que les imports CSV avant leur
-    // découpage en lots (cf. TX_IMPORT_CHUNK_SIZE côté Code.gs), sauf qu'ici
-    // la requête échoue INSTANTANÉMENT (constaté : (failed), 248ms, 0 kb
-    // dans l'onglet Réseau) au lieu de simplement timeout — trompeur, car le
-    // journal Apps Script "Exécutions" ne montre alors AUCUN appel (la
-    // requête n'atteint jamais le serveur), ce qui ressemble à tort à un
-    // problème de déploiement ou de lenteur du modèle.
-    joursDetail: (() => {
-      const JOURS_DETAIL_MAX = 60;
-      const source = fenetre.length > JOURS_DETAIL_MAX ? fenetre.slice(-JOURS_DETAIL_MAX) : fenetre;
-      return source.map(r => {
-        const veilleRow = rows.find(x => x.date === addDaysIso(r.date, -1));
-        const ecartContinuite = veilleRow ? round2((r.ouverture || 0) - (veilleRow.especesComptees || 0)) : null;
-        return {
-          date: r.date, ouverture: r.ouverture, caEsp: r.caEsp, caCB: r.caCB, sunCB: r.sunCB, caQR: r.caQR, sunQR: r.sunQR,
-          depenses: r.depenses, misesCoffre: r.misesCoffre, especesComptees: r.especesComptees,
-          ecartCaisse: r.ecartCaisse, fonds: r.fonds, pbCB: r.pbCB, pbEspDirect: r.pbEspDirect,
-          ecartContinuite, lsPostMinuitCB: r.lsPostMinuitCB || 0, lsPostMinuitQR: r.lsPostMinuitQR || 0,
-        };
-      });
-    })(),
-    joursDetailTronque: fenetre.length > 60,
+    joursDetail: joursDetailBuilt,
+    joursDetailTronque: joursDetailTronque,
     ecartsParTable: Object.entries(tableRecon).flatMap(([date, tables]) =>
       Object.entries(tables).flatMap(([table, x]) => {
         const out = [];
