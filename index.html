@@ -123,6 +123,21 @@ async function validerDepotRequest(depot) {
     return { ok: false, reason: String(err) };
   }
 }
+// Seule écriture permise depuis l'onglet "jours" (Sheet autoritaire pour tout
+// le reste, cf. commentaire au-dessus du tableau "jours") : un commentaire
+// libre par jour pour expliquer un écart sans ouvrir le Sheet. Même pattern
+// JSONP + statut vérifié que validerDepotRequest ci-dessus.
+async function commentaireRequest(date, commentaire) {
+  if (!SCRIPT_URL) return { ok: true };
+  try {
+    const params = serializeParams({ action: "save_commentaire", key: RECON_ACCESS_KEY, date, commentaire });
+    const data = await withTimeout(jsonp(`${SCRIPT_URL}?${params.toString()}`), 15000);
+    if (!data || data.status !== "ok") return { ok: false, reason: (data && data.message) || "réponse invalide" };
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: String(err) };
+  }
+}
 async function supprimerDernierDepotRequest() {
   if (!SCRIPT_URL) return { status: "error" };
   try {
@@ -972,6 +987,7 @@ function App() {
   const [expandedRepartition, setExpandedRepartition] = useState(null); // dateRepartition dépliée dans l'historique pourboires
   const [sheetStatus, setSheetStatus] = useState(SCRIPT_URL ? "loading" : "off");
   const [saveStatus, setSaveStatus] = useState(null); // { kind: "saving"|"ok"|"error", label }
+  const [commentDrafts, setCommentDrafts] = useState({}); // date -> texte en cours d'édition, avant sauvegarde (onglet "jours")
 
   const AUJOURDHUI = todayIso();
   const earliestRowDate = rows.length ? rows.reduce((min, r) => (r.date < min ? r.date : min), rows[0].date) : null;
@@ -1361,6 +1377,25 @@ function App() {
       }
     });
   }, []);
+  // Sauvegarde d'un commentaire (onglet "jours") — même pattern que
+  // persistDepot : bandeau saveStatus le temps de l'écriture, état local
+  // (rows) mis à jour seulement si le Sheet confirme, sinon bouton Réessayer.
+  const persistCommentaire = useCallback((date, commentaire) => {
+    setSaveStatus({ kind: "saving", label: `Enregistrement du commentaire du ${frDate(date)}…` });
+    commentaireRequest(date, commentaire).then(res => {
+      if (res.ok) {
+        setSaveStatus({ kind: "ok", label: `✓ Commentaire du ${frDate(date)} sauvegardé dans le Sheet.` });
+        setRows(prev => prev.map(r => r.date === date ? { ...r, commentaire } : r));
+        setCommentDrafts(prev => { const next = { ...prev }; delete next[date]; return next; });
+      } else {
+        setSaveStatus({
+          kind: "error",
+          label: `✗ Échec de sauvegarde (commentaire du ${frDate(date)})${res.reason ? " — " + res.reason : ""}`,
+          retry: () => persistCommentaire(date, commentaire),
+        });
+      }
+    });
+  }, []);
   const handleValiderDepot = () => {
     if (!window.confirm(`Valider le dépôt du ${frDate(AUJOURDHUI)} pour ${euro(agg.depotReel)} ? Ça fige la fenêtre ${frDate(debutFenetre)}→${frDate(finFenetre)} dans l'historique.`)) return;
     const depot = {
@@ -1717,7 +1752,8 @@ function App() {
             e("span", null,
               "Lecture seule — ", e("b", null, "Ouverture / CA espèces / Dépannage / Mis au coffre / Esp. comptées"), " → ",
               e("a", { href: CLOTURES_SHEET_URL, target: "_blank", rel: "noopener", style: { color: "#8B1A1A" } }, "onglet Clôtures du Sheet"), " · ",
-              e("b", null, "CB/QR (LS & Sun.)"), " → réimport CSV en haut de page."
+              e("b", null, "CB/QR (LS & Sun.)"), " → réimport CSV en haut de page · ",
+              e("b", null, "Commentaire"), " → éditable directement ci-dessous."
             )
           ),
           e("a", {
@@ -1735,7 +1771,7 @@ function App() {
           // apparaissait dans le tableau de l'onglet "Historique", qui n'a
           // pourtant aucune colonne de ce nom). Fix : clé = libellé + index,
           // texte affiché inchangé.
-          e("thead", null, e("tr", null, ["Date", "Ouverture", "CA espèces", "Espèces LS", "Δ Espèces", "CB LS", "CB Sun.", "Δ LS/Sun.", "QR LS", "QR Sun.", "Δ LS/Sun.", "Dépannage", "Mis au coffre", "Fonds théo.", "Esp. comptées", "Pourboires"].map((h, i) => e("th", { key: h + i, style: S.th }, h)))),
+          e("thead", null, e("tr", null, ["Date", "Ouverture", "CA espèces", "Espèces LS", "Δ Espèces", "CB LS", "CB Sun.", "Δ LS/Sun.", "QR LS", "QR Sun.", "Δ LS/Sun.", "Dépannage", "Mis au coffre", "Fonds théo.", "Esp. comptées", "Pourboires", "Commentaire"].map((h, i) => e("th", { key: h + i, style: S.th }, h)))),
           e("tbody", null, joursAffiches.map(r => {
             const inWindow = r.date >= debutFenetre && r.date <= finFenetre;
             const isToday = r.date === AUJOURDHUI;
@@ -1747,8 +1783,11 @@ function App() {
             // Surbrillance sobre commune à toutes les colonnes Δ, pour les
             // distinguer d'un coup d'œil comme un groupe "contrôle".
             const deltaCell = (key, delta) => e("td", { key, style: { ...S.td, ...S.deltaCell, color: Math.abs(delta) > 0.01 ? "#b04040" : "#8a7d70" } }, euro(delta));
-            // Lecture seule (Sheet autoritaire) : plus de onClick/input, juste
-            // l'affichage — cf. editHint ci-dessus pour où corriger une valeur.
+            // Lecture seule (Sheet autoritaire) pour toutes les colonnes de
+            // données — cf. editHint ci-dessus pour où corriger une valeur.
+            // Exception : "Commentaire" (dernière colonne), seule annotation
+            // qui n'existe nulle part ailleurs, éditable ici (cf. commentCell
+            // plus bas et persistCommentaire).
             // "|| 0" nécessaire (pas juste cosmétique) : un jour dont le
             // service n'est pas encore clôturé a une ligne Journalier (dès
             // qu'un CSV a été importé) mais aucune ligne Clôtures — donc pas
@@ -1763,6 +1802,29 @@ function App() {
             // mouvement non tracé entre les deux clôtures).
             const ecartContinuite = r.ecartContinuite;
             const ruptureContinuite = ecartContinuite !== null && Math.abs(ecartContinuite) > 0.01;
+            // Commentaire libre par jour, éditable : valeur affichée = brouillon
+            // en cours d'édition si présent, sinon la valeur sauvegardée dans le
+            // Sheet. Sauvegarde au blur (ou Entrée), seulement si le texte a
+            // changé — pas d'écriture inutile à chaque perte de focus.
+            const commentValue = commentDrafts[r.date] !== undefined ? commentDrafts[r.date] : (r.commentaire || "");
+            const commentSave = (val) => {
+              if (val === (r.commentaire || "")) {
+                setCommentDrafts(prev => { const next = { ...prev }; delete next[r.date]; return next; });
+                return;
+              }
+              persistCommentaire(r.date, val);
+            };
+            const commentCell = e("td", { key: "commentaire", style: { ...S.td, textAlign: "left", minWidth: 160 } },
+              e("input", {
+                type: "text",
+                value: commentValue,
+                placeholder: "—",
+                onChange: ev => setCommentDrafts(prev => ({ ...prev, [r.date]: ev.target.value })),
+                onBlur: ev => commentSave(ev.target.value),
+                onKeyDown: ev => { if (ev.key === "Enter") ev.target.blur(); },
+                style: { width: "100%", border: "1px solid #e4dcd0", borderRadius: 5, padding: "4px 7px", font: "inherit", fontSize: 12.5, background: "#fffdfa" },
+              })
+            );
             return e("tr", { key: r.date, style: { background: isToday ? "#f3efe8" : deposited ? "#f4f1ec" : inWindow ? "#fff" : "#faf8f5", opacity: isToday || deposited ? 0.5 : 1 } },
               e("td", { style: { ...S.td, fontWeight: 700, textAlign: "left" } }, frDate(r.date)),
               staticCell("ouverture", ruptureContinuite ? S.continuiteAlertCell : null,
@@ -1778,7 +1840,8 @@ function App() {
               staticCell("misesCoffre", S.misesCoffreCell),
               e("td", { style: S.td }, euro(r.fondsTheorique || 0)),
               staticCell("especesComptees"),
-              e("td", { style: { ...S.td, fontWeight: 700, color: pourboires > 0 ? "#3a7d5c" : pourboires < 0 ? "#b04040" : "#8a7d70" } }, euro(pourboires))
+              e("td", { style: { ...S.td, fontWeight: 700, color: pourboires > 0 ? "#3a7d5c" : pourboires < 0 ? "#b04040" : "#8a7d70" } }, euro(pourboires)),
+              commentCell
             );
           }))
         )
