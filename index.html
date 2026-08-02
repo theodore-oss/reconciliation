@@ -92,6 +92,46 @@ const fetchJournalier = fetchAction_("get_journalier", []);
 const fetchDepots = fetchAction_("get_depots", []);
 const fetchFondCaisse = fetchAction_("get_fond_caisse", {});
 const fetchTableRecon = fetchAction_("get_table_recon", []);
+
+// Chargement initial : UN SEUL appel (action get_all) au lieu des cinq
+// lectures ci-dessus lancées en parallèle. Ces cinq appels concurrents
+// déclenchaient autant d'exécutions Apps Script simultanées, dont certaines
+// dépassaient le timeout au premier chargement (démarrage à froid) — et
+// comme fetchAction_ retombe silencieusement sur un tableau vide, l'app
+// affichait des chiffres faux mais crédibles : fenêtre repartant du tout
+// début quand get_depots échouait, tout à zéro quand c'était get_journalier.
+// Deux différences essentielles ici :
+//  1. on distingue "échec" de "vide" — en cas d'échec on renvoie ok:false et
+//     l'appelant bascule sur l'écran d'erreur, au lieu de rendre un tableau
+//     de bord plausible mais faux ;
+//  2. on réessaie deux fois avec un délai croissant, ce qui absorbe le
+//     démarrage à froid sans que Théo ait à recharger la page lui-même.
+async function fetchAll() {
+  if (!SCRIPT_URL) return { ok: false, reason: "Google Sheets n'est pas connecté." };
+  const url = `${SCRIPT_URL}?action=get_all&key=${encodeURIComponent(RECON_ACCESS_KEY)}`;
+  for (let tentative = 1; tentative <= 3; tentative++) {
+    try {
+      // 30s (contre 12s avant) : une seule exécution qui lit les cinq
+      // onglets prend plus longtemps qu'une lecture isolée, et un démarrage
+      // à froid d'Apps Script peut à lui seul coûter plusieurs secondes.
+      const data = await withTimeout(jsonp(url), 30000);
+      // On exige la présence effective du tableau "journalier", pas seulement
+      // status:"ok". Sur un déploiement pas encore mis à jour, get_all est une
+      // action inconnue : Code.gs retombe alors sur son handler par défaut, qui
+      // répond status:"ok" avec un tout autre contenu. Sans cette vérification
+      // on repartait donc pour un tableau de bord entièrement à zéro présenté
+      // comme valide — exactement le bug qu'on cherche à supprimer.
+      if (data && data.status === "ok" && Array.isArray(data.journalier)) return { ok: true, data };
+      if (data && data.status === "ok") {
+        return { ok: false, reason: "le script déployé est une version trop ancienne (action get_all inconnue)." };
+      }
+      return { ok: false, reason: (data && data.message) || "réponse invalide du serveur." };
+    } catch (err) {
+      if (tentative === 3) return { ok: false, reason: "le Sheet n'a pas répondu après 3 tentatives." };
+      await new Promise(r => setTimeout(r, 1200 * tentative));
+    }
+  }
+}
 function serializeParams(obj) {
   const params = new URLSearchParams();
   Object.entries(obj).forEach(([k, v]) => { if (v !== undefined && v !== null) params.set(k, String(v)); });
@@ -1018,8 +1058,20 @@ function App() {
     let cancelled = false;
     setSheetStatus("loading");
     (async () => {
-      const [jRows, dRows, fcRows, rRows, trRows] = await Promise.all([fetchJournalier(), fetchDepots(), fetchFondCaisse(), fetchRepartitions(), fetchTableRecon()]);
+      const res = await fetchAll();
       if (cancelled) return;
+      // Échec = on ne touche à RIEN et on bascule sur l'écran d'erreur (pastille
+      // "Connexion échouée · réessayer", qui existait déjà mais ne se
+      // déclenchait jamais puisque les erreurs étaient avalées plus bas dans
+      // fetchAction_). Surtout, on ne remplit pas l'état avec des tableaux
+      // vides : c'est ce qui produisait une fenêtre repartant du tout début ou
+      // un tableau de bord entièrement à zéro, sans aucun signal.
+      if (!res.ok) { setSheetStatus("error"); return; }
+      const jRows  = res.data.journalier   || [];
+      const dRows  = res.data.depots       || [];
+      const fcRows = res.data.fondCaisse   || {};
+      const rRows  = res.data.repartitions || [];
+      const trRows = res.data.tableRecon   || [];
       setFondCaisse(fcRows);
       // Premier chargement (rows encore vide) : on prend telles quelles les
       // données du Sheet. Rechargement manuel/ultérieur : on re-synchronise
@@ -1623,7 +1675,22 @@ function App() {
   ) : null;
 
   let body;
-  if (sheetStatus === "loading" && rows.length === 0) {
+  if (sheetStatus === "error" && rows.length === 0) {
+    // Sans ce cas, un échec de chargement tombait dans le "else" ci-dessous et
+    // affichait le tableau de bord complet avec des données vides — fenêtre
+    // repartant du tout début, tout à zéro — sans rien indiquer d'anormal.
+    // Mieux vaut un écran d'erreur explicite que des chiffres crédibles mais faux.
+    body = e("div", { style: S.placeholder },
+      e(Icon, { name: "alert", size: 40, color: "#c0392b" }),
+      e("div", { style: { fontWeight: 700, fontSize: 16, marginTop: 12 } }, "Connexion au Google Sheet échouée"),
+      e("p", { style: { color: "#8a7d70", fontSize: 14, maxWidth: 460, textAlign: "center", lineHeight: 1.6 } },
+        "Aucune donnée n'a pu être chargée. Rien n'est affiché plutôt que d'afficher des chiffres faux."
+      ),
+      e("button", { style: { ...S.statusPill, background: "#8B1A1A", color: "#fff", border: "none", cursor: "pointer", marginTop: 8 }, onClick: reloadFromSheet },
+        e(Icon, { name: "refresh", size: 14 }), " Réessayer"
+      )
+    );
+  } else if (sheetStatus === "loading" && rows.length === 0) {
     // Chargement initial du Sheet en cours — distinct de "rien à afficher",
     // pour ne pas donner l'impression qu'il faut réimporter des CSV alors
     // que les données sont déjà sauvegardées côté Google Sheet.
