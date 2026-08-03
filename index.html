@@ -624,6 +624,27 @@ function parseSkelloNumber(v) {
   const n = parseFloat(v.trim().replace(",", "."));
   return isNaN(n) ? 0 : n;
 }
+// Clé de regroupement d'un employé entre deux fichiers hebdomadaires.
+//
+// C'était le "Matricule de paie", ce qui posait trois problèmes :
+//  - les personnes sans matricule (non salariées officiellement, comme Théo
+//    ou Adrien Delrue) étaient purement écartées de la répartition alors
+//    qu'elles font des heures et ont droit aux pourboires ;
+//  - deux contrats distincts d'une même personne (Simon Le Gall) portaient
+//    deux matricules et donnaient deux lignes, alors que leurs heures
+//    doivent être additionnées ;
+//  - quelqu'un régularisé en cours de période changeait de clé en cours de
+//    route, ce qui aurait scindé ses heures en deux.
+// Le nom règle les trois. Accents, casse et espaces multiples sont
+// normalisés pour qu'une graphie légèrement différente d'une semaine à
+// l'autre ne crée pas deux personnes.
+// Limite assumée : deux personnes réellement homonymes seraient fusionnées.
+function cleEmploye(nom, prenom) {
+  const norm = (s) => String(s || "").trim().toLowerCase()
+    .normalize("NFD").replace(/[̀-ͯ]/g, "") // retire les accents
+    .replace(/\s+/g, " ");
+  return `${norm(nom)}|${norm(prenom)}`;
+}
 function parseSkelloBuffer(arrayBuffer) {
   const wb = XLSX.read(arrayBuffer, { type: "array" });
   const sheet = wb.Sheets[wb.SheetNames[0]];
@@ -662,40 +683,47 @@ function parseSkelloBuffer(arrayBuffer) {
   const employes = [];
   const ignores = [];
   headerRows.forEach((headerRowIdx, bloc) => {
-  const header = grid[headerRowIdx].map(h => String(h || "").trim());
-  const idxNom       = header.indexOf("Nom");
-  const idxPrenom     = header.indexOf("Prénom");
-  const idxMatricule = header.indexOf("Matricule de paie");
-  const idxHeures     = header.findIndex(h => h.startsWith("Heures Travaillées"));
-  if (idxMatricule === -1 || idxHeures === -1) return;
-  const finBloc = bloc + 1 < headerRows.length ? headerRows[bloc + 1] : grid.length;
-  for (let i = headerRowIdx + 1; i < finBloc; i++) {
-    const row = grid[i];
-    const nom = String(row[idxNom] || "").trim();
-    const prenom = String(row[idxPrenom] || "").trim();
-    const matricule = String(row[idxMatricule] || "").trim();
-    // "-" = pas de matricule de paie renseigné pour cet employé (ex.
-    // contrat en cours de création). Le matricule sert de clé de cumul entre
-    // les fichiers hebdomadaires, donc sans lui on ne peut pas additionner
-    // les heures — la ligne est écartée.
-    // Elle l'était jusqu'ici en silence : la personne n'apparaissait tout
-    // simplement pas dans la répartition des pourboires, sans le moindre
-    // message, et rien ne permettait de comprendre pourquoi (constaté par
-    // Théo le 31/07, absent de la liste alors qu'il figure bien dans le
-    // fichier). On remonte désormais ces lignes à l'écran.
-    if (!matricule || matricule === "-") {
-      // On n'alerte que sur les lignes qui décrivent vraiment une personne
-      // (nom ET prénom renseignés) : ça écarte naturellement les lignes vides
-      // de fin de fichier et les lignes de titre d'un bloc ("CONTRATS
-      // EXTRAS"), qui ne remplissent qu'une seule cellule.
-      if (nom && prenom) ignores.push(`${nom} ${prenom}`.trim());
-      continue;
+    const header = grid[headerRowIdx].map(h => String(h || "").trim());
+    const idxNom       = header.indexOf("Nom");
+    const idxPrenom    = header.indexOf("Prénom");
+    const idxMatricule = header.indexOf("Matricule de paie");
+    const idxHeures    = header.findIndex(h => h.startsWith("Heures Travaillées"));
+    // Un bloc illisible est signalé plutôt que sauté en silence — c'est
+    // précisément ce genre d'abandon discret qui faisait disparaître des
+    // gens de la répartition sans que personne ne puisse le voir.
+    if (idxNom === -1 || idxPrenom === -1 || idxHeures === -1) {
+      ignores.push(`bloc commençant ligne ${headerRowIdx + 1} (colonnes Nom/Prénom/Heures introuvables)`);
+      return;
     }
-    // Garde-fou : une ligne d'en-tête ne doit jamais devenir un employé, même
-    // si un jour le découpage par blocs ci-dessus laissait passer quelque chose.
-    if (matricule === "Matricule de paie") continue;
-    employes.push({ matricule, nom, prenom, heures: parseSkelloNumber(row[idxHeures]) });
-  }
+    const finBloc = bloc + 1 < headerRows.length ? headerRows[bloc + 1] : grid.length;
+    for (let i = headerRowIdx + 1; i < finBloc; i++) {
+      const row = grid[i];
+      const nom = String(row[idxNom] || "").trim();
+      const prenom = String(row[idxPrenom] || "").trim();
+      const matricule = idxMatricule === -1 ? "" : String(row[idxMatricule] || "").trim();
+      // Une personne est identifiée par son nom + prénom, pas par son
+      // matricule : c'est la présence d'heures travaillées qui ouvre droit
+      // aux pourboires, pas le fait d'être officiellement sur la paie. Le
+      // matricule n'est plus qu'une donnée reportée dans le Sheet.
+      // On écarte donc uniquement ce qui n'est pas une personne : lignes
+      // vides de fin de fichier, lignes de titre d'un bloc ("CONTRATS
+      // EXTRAS", une seule cellule remplie) et lignes d'en-tête.
+      const estEnTete = nom === "Nom" || prenom === "Prénom" || matricule === "Matricule de paie";
+      if (estEnTete) continue;
+      if (!nom || !prenom) {
+        // Ligne avec des heures mais sans identité exploitable : on ne peut
+        // ni la rattacher à quelqu'un ni l'ignorer en silence.
+        if (parseSkelloNumber(row[idxHeures]) > 0) ignores.push(`ligne ${i + 1} du fichier`);
+        continue;
+      }
+      employes.push({
+        cle: cleEmploye(nom, prenom),
+        matricule: matricule === "-" ? "" : matricule,
+        nom,
+        prenom,
+        heures: parseSkelloNumber(row[idxHeures]),
+      });
+    }
   });
   // Seul le premier onglet du classeur est lu : si Skello répartit les
   // contrats sur plusieurs onglets (standards / extras…), les autres étaient
@@ -1262,7 +1290,7 @@ function App() {
       try {
         const { employes, ignores, autresOnglets } = parseSkelloBuffer(reader.result);
         if (ignores.length) {
-          setImportWarnings(w => [...w, `Skello · ${file.name} : ${ignores.length} personne(s) sans « Matricule de paie » dans le fichier, donc absente(s) de la répartition des pourboires — ${ignores.join(", ")}. Renseigne leur matricule dans Skello puis réimporte.`]);
+          setImportWarnings(w => [...w, `Skello · ${file.name} : ${ignores.length} ligne(s) avec des heures mais sans nom ni prénom exploitables, donc absente(s) de la répartition — ${ignores.join(", ")}.`]);
         }
         if (autresOnglets.length) {
           setImportWarnings(w => [...w, `Skello · ${file.name} : seul le premier onglet est lu, ${autresOnglets.length} autre(s) ignoré(s) — ${autresOnglets.join(", ")}.`]);
@@ -1270,10 +1298,14 @@ function App() {
         setEmployesHeures(prev => {
           const next = { ...prev };
           employes.forEach(emp => {
-            const existing = next[emp.matricule];
-            next[emp.matricule] = {
+            const existing = next[emp.cle];
+            next[emp.cle] = {
               nom: emp.nom || (existing && existing.nom) || "",
               prenom: emp.prenom || (existing && existing.prenom) || "",
+              // Le matricule n'est plus la clé, seulement une info reportée
+              // dans le Sheet : on garde le premier non vide rencontré, pour
+              // que quelqu'un régularisé en cours de période le conserve.
+              matricule: (existing && existing.matricule) || emp.matricule || "",
               heures: round2((existing ? existing.heures : 0) + emp.heures),
             };
           });
@@ -1572,7 +1604,9 @@ function App() {
       return s + jour;
     }, 0)));
     const periodeDebut = dernierePartitionDate;
-    const employesList = Object.entries(employesHeures).map(([matricule, v]) => ({ matricule, ...v }));
+    // Clé = nom+prénom normalisé (cf. cleEmploye) ; le matricule éventuel est
+    // porté par la valeur, pas par la clé.
+    const employesList = Object.entries(employesHeures).map(([cle, v]) => ({ cle, matricule: v.matricule || "", ...v }));
     const totalHeures = round2(employesList.reduce((s, emp) => s + emp.heures, 0));
     const employesAvecPart = employesList.map(emp => ({
       ...emp,
@@ -2085,7 +2119,7 @@ function App() {
         rc.employesAvecPart.length > 0 ? e("div", { style: S.tableWrap },
           e("table", { style: S.table },
             e("thead", null, e("tr", null, ["Nom", "Prénom", "Heures", "Part pourboires"].map(h => e("th", { key: h, style: S.th }, h)))),
-            e("tbody", null, rc.employesAvecPart.map(emp => e("tr", { key: emp.matricule },
+            e("tbody", null, rc.employesAvecPart.map(emp => e("tr", { key: emp.cle },
               e("td", { style: { ...S.td, textAlign: "left" } }, emp.nom),
               e("td", { style: { ...S.td, textAlign: "left" } }, emp.prenom),
               e("td", { style: S.td }, `${emp.heures} h`),
