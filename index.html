@@ -136,7 +136,7 @@ async function fetchAll() {
         lire("get_depots"),
         lire("get_fond_caisse"),
         lire("get_repartitions"),
-        lire("get_table_recon"),
+        lire("get_table_recon", `&depuis=${HISTORIQUE_DEBUT}`),
       ]);
       return { ok: true, data: { journalier, depots, fondCaisse, repartitions, tableRecon } };
     } catch (err) {
@@ -1863,8 +1863,17 @@ function App() {
     body = e("div", { style: S.placeholder },
       e(Icon, { name: "alert", size: 40, color: "#c0392b" }),
       e("div", { style: { fontWeight: 700, fontSize: 16, marginTop: 12 } }, "Connexion au Google Sheet échouée"),
-      e("p", { style: { color: "#8a7d70", fontSize: 14, maxWidth: 460, textAlign: "center", lineHeight: 1.6 } },
+      e("p", { style: { color: "#8a7d70", fontSize: 14, maxWidth: 500, textAlign: "center", lineHeight: 1.6 } },
         "Aucune donnée n'a pu être chargée. Rien n'est affiché plutôt que d'afficher des chiffres faux."
+      ),
+      // Cause de très loin la plus fréquente, et invisible autrement : si le
+      // déploiement Apps Script n'est pas en accès "Tout le monde", Google
+      // renvoie une page de connexion HTML à la place du JavaScript attendu.
+      // Le script ne se charge donc jamais et l'erreur reste incompréhensible.
+      e("p", { style: { color: "#a89b8d", fontSize: 12.5, maxWidth: 500, textAlign: "center", lineHeight: 1.6 } },
+        "Cause la plus fréquente : le déploiement Apps Script n'est pas réglé sur « Tout le monde » ",
+        "(son URL contient alors /a/macros/…). Google répond par une page de connexion au lieu des données. ",
+        "À vérifier dans Déployer › Gérer les déploiements › Qui a accès."
       ),
       e("button", { style: { ...S.statusPill, background: "#8B1A1A", color: "#fff", border: "none", cursor: "pointer", marginTop: 8 }, onClick: reloadFromSheet },
         e(Icon, { name: "refresh", size: 14 }), " Réessayer"
