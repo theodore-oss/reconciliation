@@ -262,6 +262,20 @@ const fetchRepartitions = fetchAction_("get_repartitions", []);
 // format positionnel divise la taille par deux et laisse de la marge.
 // Ne jamais renvoyer ici l'objet employé complet : il contient aussi des
 // champs internes (cle…) qui n'ont rien à faire dans l'URL ni dans le Sheet.
+// Supprime toutes les lignes d'un versement (une par employé). Sert à
+// rattraper un versement compté en double — cas rencontré le 03/08, quand une
+// validation avait en réalité abouti côté Sheet malgré l'erreur affichée.
+async function supprimerRepartitionRequest(dateRepartition) {
+  if (!SCRIPT_URL) return { ok: false, reason: "Google Sheets n'est pas connecté." };
+  try {
+    const url = `${SCRIPT_URL}?action=supprimer_repartition&key=${encodeURIComponent(RECON_ACCESS_KEY)}&date=${encodeURIComponent(dateRepartition)}`;
+    const data = await withTimeout(jsonp(url), 30000);
+    if (!data || data.status !== "ok") return { ok: false, reason: (data && data.message) || "réponse invalide" };
+    return { ok: true, supprimees: data.supprimees };
+  } catch (err) {
+    return { ok: false, reason: String(err) };
+  }
+}
 async function validerRepartitionRequest(payload) {
   if (!SCRIPT_URL) return { ok: true };
   try {
@@ -281,7 +295,9 @@ async function validerRepartitionRequest(payload) {
       return { ok: false, reason: `trop de salariés pour un seul envoi (${compact.e.length}) — préviens pour passer l'envoi par lots.` };
     }
     const data = await withTimeout(jsonp(url), 20000);
-    if (!data || data.status !== "ok") return { ok: false, reason: (data && data.message) || "réponse invalide" };
+    if (!data || data.status !== "ok") {
+      return { ok: false, code: (data && data.code) || null, reason: (data && data.message) || "réponse invalide" };
+    }
     return { ok: true };
   } catch (err) {
     return { ok: false, reason: String(err) };
@@ -1676,12 +1692,42 @@ function App() {
       } else {
         setSaveStatus({
           kind: "error",
-          label: `✗ Échec de sauvegarde (versement du ${frDate(payload.dateRepartition)})${res.reason ? " — " + res.reason : ""}`,
-          retry: () => persistRepartition(payload),
+          label: res.code === "doublon"
+            // Message explicite : c'est presque toujours un renvoi après une
+            // erreur affichée alors que l'écriture avait abouti. Surtout ne
+            // pas proposer "réessayer" ici, c'est ce qui crée le doublon.
+            ? `✗ Un versement est déjà enregistré au ${frDate(payload.dateRepartition)}. Vérifie l'historique ci-dessous : si le montant y figure, tout est déjà sauvegardé. S'il y est en double, supprime la ligne en trop.`
+            : `✗ Échec de sauvegarde (versement du ${frDate(payload.dateRepartition)})${res.reason ? " — " + res.reason : ""}`,
+          retry: res.code === "doublon" ? undefined : () => persistRepartition(payload),
         });
       }
     });
   }, []);
+  // Suppression d'un versement depuis l'historique. L'état local n'est mis à
+  // jour QUE si le Sheet a réellement confirmé — même principe que partout
+  // ailleurs, pour ne pas faire croire à une suppression qui n'a pas eu lieu.
+  const handleSupprimerRepartition = (dateRepartition) => {
+    if (!window.confirm(
+      `Supprimer définitivement le versement du ${frDate(dateRepartition)} ?\n\n`
+      + `Toutes les lignes employé de ce versement seront retirées du Sheet. `
+      + `La cagnotte en cours sera recalculée à partir du versement précédent.`
+    )) return;
+    setSaveStatus({ kind: "saving", label: `Suppression du versement du ${frDate(dateRepartition)}…` });
+    supprimerRepartitionRequest(dateRepartition).then(res => {
+      if (res.ok) {
+        setSaveStatus({ kind: "ok", label: `✓ Versement du ${frDate(dateRepartition)} supprimé (${res.supprimees} ligne(s)).` });
+        setRepartitions(prev => prev.filter(r => r.dateRepartition !== dateRepartition));
+        setExpandedRepartition(null);
+      } else {
+        setSaveStatus({
+          kind: "error",
+          label: `✗ Échec de la suppression${res.reason ? " — " + res.reason : ""}`,
+          retry: () => handleSupprimerRepartition(dateRepartition),
+        });
+      }
+    });
+  };
+
   const handleValiderRepartition = () => {
     const { cagnotte, periodeDebut, periodeFin, employesAvecPart } = repartitionCalc;
     if (employesAvecPart.length === 0) { window.alert("Importe au moins un fichier Skello avant de valider."); return; }
@@ -2188,7 +2234,15 @@ function App() {
                     e("td", { style: S.td }, g.nbSalaries ?? "—"),
                     e("td", { style: S.td }, g.totalHeures != null ? `${g.totalHeures} h` : "—"),
                     e("td", { style: { ...S.td, fontWeight: 700, color: "#8B1A1A" } }, euro0(g.montant)),
-                    e("td", { style: { ...S.td, textAlign: "right", color: "#a89b8d" } },
+                    e("td", { style: { ...S.td, textAlign: "right", color: "#a89b8d", whiteSpace: "nowrap" } },
+                      // Pas de suppression sur le versement historique en dur
+                      // (REPARTITION_HISTORIQUE) : il n'existe pas dans le
+                      // Sheet, il n'y a donc rien à y supprimer.
+                      g.historique ? null : e("button", {
+                        title: "Supprimer ce versement",
+                        onClick: (ev) => { ev.stopPropagation(); handleSupprimerRepartition(g.dateRepartition); },
+                        style: { background: "none", border: "none", color: "#c0392b", cursor: "pointer", fontSize: 13, padding: "0 8px" }
+                      }, "Supprimer"),
                       g.employes.length ? e(Icon, { name: "chevron", size: 14, color: "#a89b8d" }) : null
                     )
                   )
