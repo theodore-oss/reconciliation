@@ -628,37 +628,79 @@ function parseSkelloBuffer(arrayBuffer) {
   const wb = XLSX.read(arrayBuffer, { type: "array" });
   const sheet = wb.Sheets[wb.SheetNames[0]];
   const grid = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
-  if (!grid.length) return [];
+  // Même forme de retour que plus bas : l'appelant déstructure
+  // { employes, ignores, autresOnglets }, un tableau nu le ferait planter.
+  if (!grid.length) return { employes: [], ignores: [], autresOnglets: [] };
   // Skello ajoute 2 lignes avant les vrais en-têtes : un titre ("CONTRATS
   // STANDARDS") puis une ligne de catégories ("Données Contractuelles",
-  // "Heures Planning Période"...). On cherche donc la ligne qui contient
+  // "Heures Planning Période"...). On repère donc les lignes contenant
   // réellement "Matricule de paie" plutôt que de supposer que c'est la
   // toute première ligne du fichier.
-  let headerRowIdx = grid.findIndex(row => row.some(c => String(c || "").trim() === "Matricule de paie"));
-  if (headerRowIdx === -1) headerRowIdx = 0;
+  //
+  // Il peut y en avoir PLUSIEURS : un export contient souvent un bloc par
+  // type de contrat (standards, extras…), chacun précédé de son propre titre
+  // et de sa propre ligne d'en-tête, et rien ne garantit que les colonnes
+  // soient aux mêmes positions d'un bloc à l'autre.
+  // Le code ne cherchait auparavant que le PREMIER en-tête puis lisait tout
+  // le reste du fichier avec ces positions-là. Deux conséquences, constatées
+  // par Théo le 31/07 : la ligne d'en-tête du bloc suivant était lue comme un
+  // employé (sa cellule matricule contient le texte "Matricule de paie",
+  // donc non vide, donc acceptée) et produisait une entrée fantôme
+  // "Nom / Prénom" à 0 h ; et les vraies lignes de ce bloc, si ses colonnes
+  // étaient décalées, tombaient sur une cellule matricule vide et étaient
+  // silencieusement écartées — d'où des salariés bien présents dans l'Excel
+  // mais absents de la répartition.
+  // On lit donc chaque bloc avec SES propres positions de colonnes, borné
+  // par l'en-tête suivant.
+  const headerRows = [];
+  grid.forEach((row, i) => {
+    if (row.some(c => String(c || "").trim() === "Matricule de paie")) headerRows.push(i);
+  });
+  if (headerRows.length === 0) {
+    throw new Error('colonnes "Matricule de paie" / "Heures Travaillées (h)" introuvables — format Skello inattendu');
+  }
+  const employes = [];
+  const ignores = [];
+  headerRows.forEach((headerRowIdx, bloc) => {
   const header = grid[headerRowIdx].map(h => String(h || "").trim());
   const idxNom       = header.indexOf("Nom");
   const idxPrenom     = header.indexOf("Prénom");
   const idxMatricule = header.indexOf("Matricule de paie");
   const idxHeures     = header.findIndex(h => h.startsWith("Heures Travaillées"));
-  if (idxMatricule === -1 || idxHeures === -1) {
-    throw new Error('colonnes "Matricule de paie" / "Heures Travaillées (h)" introuvables — format Skello inattendu');
-  }
-  const employes = [];
-  for (let i = headerRowIdx + 1; i < grid.length; i++) {
+  if (idxMatricule === -1 || idxHeures === -1) return;
+  const finBloc = bloc + 1 < headerRows.length ? headerRows[bloc + 1] : grid.length;
+  for (let i = headerRowIdx + 1; i < finBloc; i++) {
     const row = grid[i];
+    const nom = String(row[idxNom] || "").trim();
+    const prenom = String(row[idxPrenom] || "").trim();
     const matricule = String(row[idxMatricule] || "").trim();
     // "-" = pas de matricule de paie renseigné pour cet employé (ex.
-    // contrat en cours de création) — on l'ignore, comme une case vide.
-    if (!matricule || matricule === "-") continue;
-    employes.push({
-      matricule,
-      nom: String(row[idxNom] || "").trim(),
-      prenom: String(row[idxPrenom] || "").trim(),
-      heures: parseSkelloNumber(row[idxHeures]),
-    });
+    // contrat en cours de création). Le matricule sert de clé de cumul entre
+    // les fichiers hebdomadaires, donc sans lui on ne peut pas additionner
+    // les heures — la ligne est écartée.
+    // Elle l'était jusqu'ici en silence : la personne n'apparaissait tout
+    // simplement pas dans la répartition des pourboires, sans le moindre
+    // message, et rien ne permettait de comprendre pourquoi (constaté par
+    // Théo le 31/07, absent de la liste alors qu'il figure bien dans le
+    // fichier). On remonte désormais ces lignes à l'écran.
+    if (!matricule || matricule === "-") {
+      // On n'alerte que sur les lignes qui décrivent vraiment une personne
+      // (nom ET prénom renseignés) : ça écarte naturellement les lignes vides
+      // de fin de fichier et les lignes de titre d'un bloc ("CONTRATS
+      // EXTRAS"), qui ne remplissent qu'une seule cellule.
+      if (nom && prenom) ignores.push(`${nom} ${prenom}`.trim());
+      continue;
+    }
+    // Garde-fou : une ligne d'en-tête ne doit jamais devenir un employé, même
+    // si un jour le découpage par blocs ci-dessus laissait passer quelque chose.
+    if (matricule === "Matricule de paie") continue;
+    employes.push({ matricule, nom, prenom, heures: parseSkelloNumber(row[idxHeures]) });
   }
-  return employes;
+  });
+  // Seul le premier onglet du classeur est lu : si Skello répartit les
+  // contrats sur plusieurs onglets (standards / extras…), les autres étaient
+  // ignorés sans que rien ne le signale.
+  return { employes, ignores, autresOnglets: wb.SheetNames.slice(1) };
 }
 
 function round2(n) { return Math.round((n + Number.EPSILON) * 100) / 100; }
@@ -1218,7 +1260,13 @@ function App() {
     const reader = new FileReader();
     reader.onload = () => {
       try {
-        const employes = parseSkelloBuffer(reader.result);
+        const { employes, ignores, autresOnglets } = parseSkelloBuffer(reader.result);
+        if (ignores.length) {
+          setImportWarnings(w => [...w, `Skello · ${file.name} : ${ignores.length} personne(s) sans « Matricule de paie » dans le fichier, donc absente(s) de la répartition des pourboires — ${ignores.join(", ")}. Renseigne leur matricule dans Skello puis réimporte.`]);
+        }
+        if (autresOnglets.length) {
+          setImportWarnings(w => [...w, `Skello · ${file.name} : seul le premier onglet est lu, ${autresOnglets.length} autre(s) ignoré(s) — ${autresOnglets.join(", ")}.`]);
+        }
         setEmployesHeures(prev => {
           const next = { ...prev };
           employes.forEach(emp => {
