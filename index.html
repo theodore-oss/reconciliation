@@ -108,7 +108,11 @@ const fetchTableRecon = fetchAction_("get_table_recon", []);
 //     démarrage à froid sans que Théo ait à recharger la page lui-même.
 async function fetchAll() {
   if (!SCRIPT_URL) return { ok: false, reason: "Google Sheets n'est pas connecté." };
-  const url = `${SCRIPT_URL}?action=get_all&key=${encodeURIComponent(RECON_ACCESS_KEY)}`;
+  // depuis : borne les deux onglets qui grossissent sans fin (Journalier et
+  // surtout ReconciliationTable). HISTORIQUE_DEBUT est déjà la date avant
+  // laquelle l'app n'affiche rien, donc rien ne change à l'écran — on cesse
+  // simplement de transporter un historique que personne ne regarde.
+  const url = `${SCRIPT_URL}?action=get_all&key=${encodeURIComponent(RECON_ACCESS_KEY)}&depuis=${HISTORIQUE_DEBUT}`;
   for (let tentative = 1; tentative <= 3; tentative++) {
     try {
       // 30s (contre 12s avant) : une seule exécution qui lit les cinq
@@ -1643,7 +1647,9 @@ function App() {
     const periodeDebut = dernierePartitionDate;
     // Clé = nom+prénom normalisé (cf. cleEmploye) ; le matricule éventuel est
     // porté par la valeur, pas par la clé.
-    const employesList = Object.entries(employesHeures).map(([cle, v]) => ({ cle, matricule: v.matricule || "", ...v }));
+    // ...v en PREMIER : placé en dernier, il réécrasait matricule avec la
+    // valeur éventuellement absente de l'état, annulant la valeur de repli.
+    const employesList = Object.entries(employesHeures).map(([cle, v]) => ({ ...v, cle, matricule: v.matricule || "" }));
     const totalHeures = round2(employesList.reduce((s, emp) => s + emp.heures, 0));
     const employesAvecPart = employesList.map(emp => ({
       ...emp,
