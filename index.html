@@ -713,13 +713,16 @@ function parseSkelloBuffer(arrayBuffer) {
     const idxPrenom    = header.indexOf("Prénom");
     const idxMatricule = header.indexOf("Matricule de paie");
     const idxHeures    = header.findIndex(h => h.startsWith("Heures Travaillées"));
-    // Un bloc illisible est signalé plutôt que sauté en silence — c'est
-    // précisément ce genre d'abandon discret qui faisait disparaître des
-    // gens de la répartition sans que personne ne puisse le voir.
-    if (idxNom === -1 || idxPrenom === -1 || idxHeures === -1) {
-      ignores.push(`bloc commençant ligne ${headerRowIdx + 1} (colonnes Nom/Prénom/Heures introuvables)`);
-      return;
-    }
+    // Un bloc dont l'en-tête ne porte pas Nom/Prénom/Heures ne décrit pas des
+    // heures travaillées exploitables : dans l'export de juillet 2026 il
+    // s'agit d'un second bloc démarrant ligne 39, que Théo a examiné et
+    // confirmé sans intérêt pour la répartition (03/08). On le saute donc
+    // sans alerter — un avertissement à chaque import pour un cas connu et
+    // volontaire finirait par rendre toute la zone d'avertissements
+    // inaudible, ce qui coûterait plus cher que ça ne rapporte.
+    // Le filet de sécurité est plus bas : si AUCUN employé n'a pu être lu
+    // dans tout le fichier, l'import échoue franchement.
+    if (idxNom === -1 || idxPrenom === -1 || idxHeures === -1) return;
     const finBloc = bloc + 1 < headerRows.length ? headerRows[bloc + 1] : grid.length;
     for (let i = headerRowIdx + 1; i < finBloc; i++) {
       const row = grid[i];
@@ -750,6 +753,12 @@ function parseSkelloBuffer(arrayBuffer) {
       });
     }
   });
+  // Filet de sécurité : zéro employé lu dans tout le fichier, c'est que le
+  // format a changé (colonnes renommées, structure différente). Mieux vaut un
+  // échec franc qu'un import "réussi" qui n'ajoute personne.
+  if (employes.length === 0) {
+    throw new Error("aucun employé lisible — le format du fichier a probablement changé");
+  }
   // Seul le premier onglet du classeur est lu : si Skello répartit les
   // contrats sur plusieurs onglets (standards / extras…), les autres étaient
   // ignorés sans que rien ne le signale.
@@ -1317,9 +1326,12 @@ function App() {
         if (ignores.length) {
           setImportWarnings(w => [...w, `Skello · ${file.name} : ${ignores.length} ligne(s) avec des heures mais sans nom ni prénom exploitables, donc absente(s) de la répartition — ${ignores.join(", ")}.`]);
         }
-        if (autresOnglets.length) {
-          setImportWarnings(w => [...w, `Skello · ${file.name} : seul le premier onglet est lu, ${autresOnglets.length} autre(s) ignoré(s) — ${autresOnglets.join(", ")}.`]);
-        }
+        // Les onglets suivants de l'export Skello ("Fiche employés",
+        // "Détails", "Absences Employés", "Récap Compteurs", "Solde Congés")
+        // sont des annexes : seul le premier porte les heures travaillées.
+        // Vérifié avec Théo le 03/08, donc plus d'avertissement — le signaler
+        // à chaque import banaliserait la zone d'avertissements.
+        void autresOnglets;
         setEmployesHeures(prev => {
           const next = { ...prev };
           employes.forEach(emp => {
