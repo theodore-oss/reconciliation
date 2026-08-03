@@ -132,37 +132,51 @@ const fetchTableRecon = fetchAction_("get_table_recon", []);
 // début, ou tout à zéro).
 async function fetchAll() {
   if (!SCRIPT_URL) return { ok: false, reason: "Google Sheets n'est pas connecté." };
-  const lire = async (action, extra = "") => {
+  const lectures = [
+    ["get_journalier",  `&depuis=${HISTORIQUE_DEBUT}`],
+    ["get_depots",      ""],
+    ["get_fond_caisse", ""],
+    ["get_repartitions", ""],
+    ["get_table_recon", `&depuis=${HISTORIQUE_DEBUT}`],
+  ];
+  const lire = async ([action, extra]) => {
     const url = `${SCRIPT_URL}?action=${action}&key=${encodeURIComponent(RECON_ACCESS_KEY)}${extra}`;
-    const data = await withTimeout(jsonp(url), 20000);
+    const data = await withTimeout(jsonp(url), 25000);
     // "rows" doit être réellement présent : une action inconnue d'un script
     // pas encore redéployé retombe sur le handler par défaut, qui répond
     // status:"ok" avec un tout autre contenu.
-    if (!data || data.status !== "ok" || !("rows" in data)) throw new Error(action);
+    if (!data || data.status !== "ok" || !("rows" in data)) throw new Error("réponse invalide");
     return data.rows;
   };
-  for (let tentative = 1; tentative <= 2; tentative++) {
-    // allSettled et non all : Promise.all s'arrête au PREMIER échec, ce qui
-    // masque les autres. On veut la liste complète des lectures fautives —
-    // sinon un message "connexion échouée" ne dit pas laquelle réparer, et on
-    // en est réduit à tester les actions une par une dans le navigateur.
-    const res = await Promise.allSettled([
-      lire("get_journalier", `&depuis=${HISTORIQUE_DEBUT}`),
-      lire("get_depots"),
-      lire("get_fond_caisse"),
-      lire("get_repartitions"),
-      lire("get_table_recon", `&depuis=${HISTORIQUE_DEBUT}`),
-    ]);
-    const echecs = res.filter(r => r.status === "rejected").map(r => r.reason && r.reason.message);
-    if (echecs.length === 0) {
-      const [journalier, depots, fondCaisse, repartitions, tableRecon] = res.map(r => r.value);
-      return { ok: true, data: { journalier, depots, fondCaisse, repartitions, tableRecon } };
+
+  // Premier passage : les cinq lectures en parallèle, pour la vitesse.
+  // Apps Script refuse régulièrement UNE des requêtes d'une rafale simultanée
+  // (échec HTTP immédiat, "JSONP request failed" via script.onerror — pas une
+  // expiration). Rien d'anormal ni de réparable côté serveur : c'est une
+  // limite de concurrence.
+  const res = await Promise.allSettled(lectures.map(lire));
+  const valeurs = res.map(r => (r.status === "fulfilled" ? r.value : undefined));
+
+  // Second passage : UNIQUEMENT les lectures manquantes, une par une et
+  // espacées. C'est le cœur du correctif — relancer les cinq (ce que faisait
+  // la version précédente) recréait la rafale et donc le même échec, alors
+  // qu'une lecture isolée passe sans difficulté.
+  for (let i = 0; i < lectures.length; i++) {
+    if (valeurs[i] !== undefined) continue;
+    for (let essai = 1; essai <= 3 && valeurs[i] === undefined; essai++) {
+      await new Promise(r => setTimeout(r, 500 * essai));
+      try {
+        valeurs[i] = await lire(lectures[i]);
+      } catch (err) {
+        if (essai === 3) {
+          return { ok: false, reason: `${lectures[i][0]} — ${err.message}` };
+        }
+      }
     }
-    if (tentative === 2) {
-      return { ok: false, reason: `lecture(s) en échec : ${echecs.join(", ")}.` };
-    }
-    await new Promise(r => setTimeout(r, 1000));
   }
+
+  const [journalier, depots, fondCaisse, repartitions, tableRecon] = valeurs;
+  return { ok: true, data: { journalier, depots, fondCaisse, repartitions, tableRecon } };
 }
 function serializeParams(obj) {
   const params = new URLSearchParams();
@@ -1891,14 +1905,9 @@ function App() {
       // dit pas QUELLE lecture a échoué, et il faut tester les actions une par
       // une dans le navigateur pour le découvrir.
       sheetError ? e("p", { style: { color: "#c0392b", fontSize: 12.5, maxWidth: 500, textAlign: "center", fontFamily: "monospace" } }, sheetError) : null,
-      // Cause de très loin la plus fréquente, et invisible autrement : si le
-      // déploiement Apps Script n'est pas en accès "Tout le monde", Google
-      // renvoie une page de connexion HTML à la place du JavaScript attendu.
-      // Le script ne se charge donc jamais et l'erreur reste incompréhensible.
       e("p", { style: { color: "#a89b8d", fontSize: 12.5, maxWidth: 500, textAlign: "center", lineHeight: 1.6 } },
-        "Cause la plus fréquente : le déploiement Apps Script n'est pas réglé sur « Tout le monde » ",
-        "(son URL contient alors /a/macros/…). Google répond par une page de connexion au lieu des données. ",
-        "À vérifier dans Déployer › Gérer les déploiements › Qui a accès."
+        "Les données n'ont pas pu être relues malgré plusieurs tentatives. ",
+        "Réessaie dans quelques instants : le Sheet lui-même n'est pas en cause, rien n'a été modifié."
       ),
       e("button", { style: { ...S.statusPill, background: "#8B1A1A", color: "#fff", border: "none", cursor: "pointer", marginTop: 8 }, onClick: reloadFromSheet },
         e(Icon, { name: "refresh", size: 14 }), " Réessayer"
