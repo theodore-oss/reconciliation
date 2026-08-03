@@ -106,33 +106,42 @@ const fetchTableRecon = fetchAction_("get_table_recon", []);
 //     de bord plausible mais faux ;
 //  2. on réessaie deux fois avec un délai croissant, ce qui absorbe le
 //     démarrage à froid sans que Théo ait à recharger la page lui-même.
+// Les cinq lectures repartent EN PARALLÈLE : l'attente vaut la plus lente et
+// non leur somme. Une version intermédiaire les enchaînait dans un seul appel
+// (action get_all), ce qui avait rendu le chargement nettement plus long sans
+// rien apporter — la concurrence entre exécutions Apps Script n'a jamais été
+// démontrée comme responsable des expirations d'origine.
+//
+// Ce qui change par rapport à la version d'avant, et qui est le vrai
+// correctif : une lecture qui échoue n'est plus remplacée en silence par un
+// tableau vide. Promise.all rejette au premier échec, on réessaie une fois,
+// puis on renvoie ok:false — l'app affiche alors un écran d'erreur explicite
+// au lieu d'un tableau de bord plausible mais faux (fenêtre repartant du tout
+// début, ou tout à zéro).
 async function fetchAll() {
   if (!SCRIPT_URL) return { ok: false, reason: "Google Sheets n'est pas connecté." };
-  // depuis : borne les deux onglets qui grossissent sans fin (Journalier et
-  // surtout ReconciliationTable). HISTORIQUE_DEBUT est déjà la date avant
-  // laquelle l'app n'affiche rien, donc rien ne change à l'écran — on cesse
-  // simplement de transporter un historique que personne ne regarde.
-  const url = `${SCRIPT_URL}?action=get_all&key=${encodeURIComponent(RECON_ACCESS_KEY)}&depuis=${HISTORIQUE_DEBUT}`;
-  for (let tentative = 1; tentative <= 3; tentative++) {
+  const lire = async (action, extra = "") => {
+    const url = `${SCRIPT_URL}?action=${action}&key=${encodeURIComponent(RECON_ACCESS_KEY)}${extra}`;
+    const data = await withTimeout(jsonp(url), 20000);
+    // "rows" doit être réellement présent : une action inconnue d'un script
+    // pas encore redéployé retombe sur le handler par défaut, qui répond
+    // status:"ok" avec un tout autre contenu.
+    if (!data || data.status !== "ok" || !("rows" in data)) throw new Error(action);
+    return data.rows;
+  };
+  for (let tentative = 1; tentative <= 2; tentative++) {
     try {
-      // 30s (contre 12s avant) : une seule exécution qui lit les cinq
-      // onglets prend plus longtemps qu'une lecture isolée, et un démarrage
-      // à froid d'Apps Script peut à lui seul coûter plusieurs secondes.
-      const data = await withTimeout(jsonp(url), 30000);
-      // On exige la présence effective du tableau "journalier", pas seulement
-      // status:"ok". Sur un déploiement pas encore mis à jour, get_all est une
-      // action inconnue : Code.gs retombe alors sur son handler par défaut, qui
-      // répond status:"ok" avec un tout autre contenu. Sans cette vérification
-      // on repartait donc pour un tableau de bord entièrement à zéro présenté
-      // comme valide — exactement le bug qu'on cherche à supprimer.
-      if (data && data.status === "ok" && Array.isArray(data.journalier)) return { ok: true, data };
-      if (data && data.status === "ok") {
-        return { ok: false, reason: "le script déployé est une version trop ancienne (action get_all inconnue)." };
-      }
-      return { ok: false, reason: (data && data.message) || "réponse invalide du serveur." };
+      const [journalier, depots, fondCaisse, repartitions, tableRecon] = await Promise.all([
+        lire("get_journalier", `&depuis=${HISTORIQUE_DEBUT}`),
+        lire("get_depots"),
+        lire("get_fond_caisse"),
+        lire("get_repartitions"),
+        lire("get_table_recon"),
+      ]);
+      return { ok: true, data: { journalier, depots, fondCaisse, repartitions, tableRecon } };
     } catch (err) {
-      if (tentative === 3) return { ok: false, reason: "le Sheet n'a pas répondu après 3 tentatives." };
-      await new Promise(r => setTimeout(r, 1200 * tentative));
+      if (tentative === 2) return { ok: false, reason: `lecture « ${err.message} » impossible.` };
+      await new Promise(r => setTimeout(r, 1000));
     }
   }
 }
