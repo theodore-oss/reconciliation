@@ -39,10 +39,22 @@ const e = React.createElement;
 // Projet Apps Script séparé de celui de caisse (aucun risque pour la prod).
 // ————————————————————————————————————————————————————————
 // Déploiement DÉDIÉ, distinct de celui du formulaire de clôture (Caisse/
-// index.html), restreint à "Anyone within grupodomingo.io" — le formulaire
-// de clôture garde lui son propre déploiement en "Anyone" (staff sans
-// compte Google, juste le code PIN), sur le même script/Sheet.
-const SCRIPT_URL = "https://script.google.com/a/macros/grupodomingo.io/s/AKfycbxJTaRH3VkmOXGfornNZ4TNNjQWd4VcIc6gWwZxUJFReHJYstttakUSCdiA-CimpwWzJw/exec";
+// index.html), sur le même script/Sheet.
+//
+// ⚠️ "Qui a accès" DOIT rester sur "Tout le monde". Ce déploiement était
+// auparavant restreint à grupodomingo.io — son URL contenait alors le segment
+// /a/macros/grupodomingo.io/ — et c'était la cause des échecs de connexion
+// intermittents (03/08) : sur une session Google jugée insuffisante, Google
+// répond une page de connexion HTML au lieu du JavaScript attendu. Le
+// <script> du JSONP échoue alors sans que la page puisse lire la raison,
+// d'où des "JSONP request failed" et des expirations apparemment aléatoires,
+// qui disparaissaient après deux ou trois rechargements.
+// Le JSONP est incompatible avec une URL susceptible de rediriger vers un
+// écran de connexion : si l'accès doit être restreint un jour, il faudra
+// changer de mécanisme de transport, pas seulement ce réglage.
+// La protection repose donc sur RECON_ACCESS_KEY ci-dessous (verrou faible,
+// la clé étant visible dans cette page publique — cf. son commentaire).
+const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxJTaRH3VkmOXGfornNZ4TNNjQWd4VcIc6gWwZxUJFReHJYstttakUSCdiA-CimpwWzJw/exec";
 // Lien direct vers l'onglet "Clôtures" du classeur (gid=1855935269) — pas
 // une action de l'app, juste un raccourci affiché dans "jours"/"Aide" pour
 // ouvrir le bon endroit où corriger ouverture/dépannage/mis au coffre/esp.
