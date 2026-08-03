@@ -142,19 +142,26 @@ async function fetchAll() {
     return data.rows;
   };
   for (let tentative = 1; tentative <= 2; tentative++) {
-    try {
-      const [journalier, depots, fondCaisse, repartitions, tableRecon] = await Promise.all([
-        lire("get_journalier", `&depuis=${HISTORIQUE_DEBUT}`),
-        lire("get_depots"),
-        lire("get_fond_caisse"),
-        lire("get_repartitions"),
-        lire("get_table_recon", `&depuis=${HISTORIQUE_DEBUT}`),
-      ]);
+    // allSettled et non all : Promise.all s'arrête au PREMIER échec, ce qui
+    // masque les autres. On veut la liste complète des lectures fautives —
+    // sinon un message "connexion échouée" ne dit pas laquelle réparer, et on
+    // en est réduit à tester les actions une par une dans le navigateur.
+    const res = await Promise.allSettled([
+      lire("get_journalier", `&depuis=${HISTORIQUE_DEBUT}`),
+      lire("get_depots"),
+      lire("get_fond_caisse"),
+      lire("get_repartitions"),
+      lire("get_table_recon", `&depuis=${HISTORIQUE_DEBUT}`),
+    ]);
+    const echecs = res.filter(r => r.status === "rejected").map(r => r.reason && r.reason.message);
+    if (echecs.length === 0) {
+      const [journalier, depots, fondCaisse, repartitions, tableRecon] = res.map(r => r.value);
       return { ok: true, data: { journalier, depots, fondCaisse, repartitions, tableRecon } };
-    } catch (err) {
-      if (tentative === 2) return { ok: false, reason: `lecture « ${err.message} » impossible.` };
-      await new Promise(r => setTimeout(r, 1000));
     }
+    if (tentative === 2) {
+      return { ok: false, reason: `lecture(s) en échec : ${echecs.join(", ")}.` };
+    }
+    await new Promise(r => setTimeout(r, 1000));
   }
 }
 function serializeParams(obj) {
@@ -1171,6 +1178,7 @@ function App() {
   const [skelloFileNames, setSkelloFileNames] = useState([]);
   const [expandedRepartition, setExpandedRepartition] = useState(null); // dateRepartition dépliée dans l'historique pourboires
   const [sheetStatus, setSheetStatus] = useState(SCRIPT_URL ? "loading" : "off");
+  const [sheetError, setSheetError] = useState(null); // détail de l'échec de chargement, affiché à l'écran
   const [saveStatus, setSaveStatus] = useState(null); // { kind: "saving"|"ok"|"error", label }
   const [commentDrafts, setCommentDrafts] = useState({}); // date -> texte en cours d'édition, avant sauvegarde (onglet "jours")
 
@@ -1211,7 +1219,8 @@ function App() {
       // fetchAction_). Surtout, on ne remplit pas l'état avec des tableaux
       // vides : c'est ce qui produisait une fenêtre repartant du tout début ou
       // un tableau de bord entièrement à zéro, sans aucun signal.
-      if (!res.ok) { setSheetStatus("error"); return; }
+      if (!res.ok) { setSheetError(res.reason || null); setSheetStatus("error"); return; }
+      setSheetError(null);
       const jRows  = res.data.journalier   || [];
       const dRows  = res.data.depots       || [];
       const fcRows = res.data.fondCaisse   || {};
@@ -1878,6 +1887,10 @@ function App() {
       e("p", { style: { color: "#8a7d70", fontSize: 14, maxWidth: 500, textAlign: "center", lineHeight: 1.6 } },
         "Aucune donnée n'a pu être chargée. Rien n'est affiché plutôt que d'afficher des chiffres faux."
       ),
+      // Détail technique affiché à l'écran : sans lui, "connexion échouée" ne
+      // dit pas QUELLE lecture a échoué, et il faut tester les actions une par
+      // une dans le navigateur pour le découvrir.
+      sheetError ? e("p", { style: { color: "#c0392b", fontSize: 12.5, maxWidth: 500, textAlign: "center", fontFamily: "monospace" } }, sheetError) : null,
       // Cause de très loin la plus fréquente, et invisible autrement : si le
       // déploiement Apps Script n'est pas en accès "Tout le monde", Google
       // renvoie une page de connexion HTML à la place du JavaScript attendu.
