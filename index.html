@@ -247,10 +247,35 @@ const fetchRepartitions = fetchAction_("get_repartitions", []);
 // requête qui échoue silencieusement (timeout, erreur serveur) laissait
 // quand même handleValiderRepartition mettre à jour l'état local comme si
 // le versement avait été enregistré.
+// Payload COMPACT (clés d'une lettre, employés en tableaux positionnels
+// [matricule, nom, prénom, heures, montant] plutôt qu'en objets).
+// Tout part dans l'URL d'un GET/JSONP, dont la longueur est limitée côté
+// navigateur ET côté infra Google. Avec une quarantaine de salariés, le
+// format objet complet — noms de champs répétés à chaque ligne, accents
+// gonflés à 6 caractères par encodeURIComponent — dépassait la limite : le
+// <script> n'était alors jamais chargé et l'app affichait "Error: JSONP
+// request failed" au moment de valider (constaté par Théo le 03/08). Le
+// format positionnel divise la taille par deux et laisse de la marge.
+// Ne jamais renvoyer ici l'objet employé complet : il contient aussi des
+// champs internes (cle…) qui n'ont rien à faire dans l'URL ni dans le Sheet.
 async function validerRepartitionRequest(payload) {
   if (!SCRIPT_URL) return { ok: true };
   try {
-    const url = `${SCRIPT_URL}?action=valider_repartition&key=${encodeURIComponent(RECON_ACCESS_KEY)}&payload=${encodeURIComponent(JSON.stringify(payload))}`;
+    const compact = {
+      d: payload.dateRepartition,
+      a: payload.periodeDebut,
+      b: payload.periodeFin,
+      e: (payload.employes || []).map(emp => [
+        emp.matricule || "", emp.nom || "", emp.prenom || "",
+        emp.heures || 0, emp.montant || 0,
+      ]),
+    };
+    const url = `${SCRIPT_URL}?action=valider_repartition&key=${encodeURIComponent(RECON_ACCESS_KEY)}&payload=${encodeURIComponent(JSON.stringify(compact))}`;
+    // Diagnostic explicite plutôt qu'un "JSONP request failed" incompréhensible
+    // si l'effectif devenait un jour trop important pour tenir dans une URL.
+    if (url.length > 7000) {
+      return { ok: false, reason: `trop de salariés pour un seul envoi (${compact.e.length}) — préviens pour passer l'envoi par lots.` };
+    }
     const data = await withTimeout(jsonp(url), 20000);
     if (!data || data.status !== "ok") return { ok: false, reason: (data && data.message) || "réponse invalide" };
     return { ok: true };
