@@ -138,6 +138,7 @@ async function fetchAll() {
     ["get_fond_caisse", ""],
     ["get_repartitions", ""],
     ["get_table_recon", `&depuis=${HISTORIQUE_DEBUT}`],
+    ["get_ajustements_pourboires", ""],
   ];
   const lire = async ([action, extra]) => {
     const url = `${SCRIPT_URL}?action=${action}&key=${encodeURIComponent(RECON_ACCESS_KEY)}${extra}`;
@@ -175,8 +176,8 @@ async function fetchAll() {
     }
   }
 
-  const [journalier, depots, fondCaisse, repartitions, tableRecon] = valeurs;
-  return { ok: true, data: { journalier, depots, fondCaisse, repartitions, tableRecon } };
+  const [journalier, depots, fondCaisse, repartitions, tableRecon, ajustementsPourboires] = valeurs;
+  return { ok: true, data: { journalier, depots, fondCaisse, repartitions, tableRecon, ajustementsPourboires } };
 }
 function serializeParams(obj) {
   const params = new URLSearchParams();
@@ -218,6 +219,33 @@ async function commentaireRequest(date, commentaire) {
   try {
     const params = serializeParams({ action: "save_commentaire", key: RECON_ACCESS_KEY, date, commentaire });
     const data = await withTimeout(jsonp(`${SCRIPT_URL}?${params.toString()}`), 15000);
+    if (!data || data.status !== "ok") return { ok: false, reason: (data && data.message) || "réponse invalide" };
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: String(err) };
+  }
+}
+// Correction manuelle ajoutée à la cagnotte pourboires en cours — ex. un
+// employé parti sans récupérer sa part, remise dans le pot commun. "id" est
+// généré côté client (cf. handleAjouterAjustementPourboires) : plusieurs
+// corrections peuvent tomber le même jour, il faut donc pouvoir en cibler
+// une précise pour la supprimer (cf. supprimerAjustementPourboiresRequest),
+// contrairement à supprimerRepartitionRequest qui vise par date.
+async function ajouterAjustementPourboiresRequest(ajustement) {
+  if (!SCRIPT_URL) return { ok: false, reason: "Google Sheets n'est pas connecté." };
+  try {
+    const params = serializeParams({ action: "ajouter_ajustement_pourboires", key: RECON_ACCESS_KEY, ...ajustement });
+    const data = await withTimeout(jsonp(`${SCRIPT_URL}?${params.toString()}`), 15000);
+    if (!data || data.status !== "ok") return { ok: false, reason: (data && data.message) || "réponse invalide" };
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: String(err) };
+  }
+}
+async function supprimerAjustementPourboiresRequest(id) {
+  if (!SCRIPT_URL) return { ok: false, reason: "Google Sheets n'est pas connecté." };
+  try {
+    const data = await withTimeout(jsonp(`${SCRIPT_URL}?action=supprimer_ajustement_pourboires&key=${encodeURIComponent(RECON_ACCESS_KEY)}&id=${encodeURIComponent(id)}`), 15000);
     if (!data || data.status !== "ok") return { ok: false, reason: (data && data.message) || "réponse invalide" };
     return { ok: true };
   } catch (err) {
@@ -1188,6 +1216,7 @@ function App() {
   const [tableReconRows, setTableReconRows] = useState([]); // persisté sur le Sheet (ReconciliationTable) — survit au refresh
   const [depots, setDepots] = useState([]);
   const [repartitions, setRepartitions] = useState([]);
+  const [ajustementsPourboires, setAjustementsPourboires] = useState([]); // corrections manuelles (Ajustements_Pourboires) — cf. persistAjustementPourboires
   const [employesHeures, setEmployesHeures] = useState({}); // matricule -> {nom, prenom, heures}
   const [skelloFileNames, setSkelloFileNames] = useState([]);
   const [expandedRepartition, setExpandedRepartition] = useState(null); // dateRepartition dépliée dans l'historique pourboires
@@ -1195,6 +1224,8 @@ function App() {
   const [sheetError, setSheetError] = useState(null); // détail de l'échec de chargement, affiché à l'écran
   const [saveStatus, setSaveStatus] = useState(null); // { kind: "saving"|"ok"|"error", label }
   const [commentDrafts, setCommentDrafts] = useState({}); // date -> texte en cours d'édition, avant sauvegarde (onglet "jours")
+  const [ajustementMontant, setAjustementMontant] = useState(""); // formulaire "Ajouter au pot" (onglet Pourboires)
+  const [ajustementMotif, setAjustementMotif] = useState("");
 
   const AUJOURDHUI = todayIso();
   const earliestRowDate = rows.length ? rows.reduce((min, r) => (r.date < min ? r.date : min), rows[0].date) : null;
@@ -1240,6 +1271,7 @@ function App() {
       const fcRows = res.data.fondCaisse   || {};
       const rRows  = res.data.repartitions || [];
       const trRows = res.data.tableRecon   || [];
+      const arRows = res.data.ajustementsPourboires || [];
       setFondCaisse(fcRows);
       // Premier chargement (rows encore vide) : on prend telles quelles les
       // données du Sheet. Rechargement manuel/ultérieur : on re-synchronise
@@ -1249,6 +1281,7 @@ function App() {
       setDepots(dRows);
       setRepartitions(rRows);
       setTableReconRows(prev => (prev.length && reloadTick === 0 ? prev : trRows));
+      setAjustementsPourboires(arRows);
       setSheetStatus("ok");
     })().catch(() => { if (!cancelled) setSheetStatus("error"); });
     return () => { cancelled = true; };
@@ -1698,12 +1731,20 @@ function App() {
     // mathématiquement identiques quand elles portent sur la même période.
     // Seul le total final est plafonné à 0 (on ne "doit" jamais une
     // cagnotte négative au personnel).
-    const cagnotte = Math.max(0, round2(joursInclus.reduce((s, r) => {
+    const cagnotteJournaliere = round2(joursInclus.reduce((s, r) => {
       const veilleRow = rows.find(x => x.date === addDaysIso(r.date, -1));
       const gapContinuite = veilleRow ? round2((r.ouverture || 0) - (veilleRow.especesComptees || 0)) : 0;
       const jour = round2((r.especesComptees || 0) - (r.fondsTheorique || 0) + gapContinuite);
       return s + jour;
-    }, 0)));
+    }, 0));
+    // Corrections manuelles (ex. pourboires non récupérés par un employé qui
+    // part, remis dans le pot) : mêmes bornes que joursInclus ci-dessus — une
+    // correction datée avant le dernier versement ne compte plus, exactement
+    // comme un jour déjà versé, donc elle "sort" automatiquement de la
+    // cagnotte dès qu'un nouveau versement est validé, sans traitement à part.
+    const ajustementsInclus = ajustementsPourboires.filter(a => a.date >= dernierePartitionDate && a.date <= finCagnotte);
+    const totalAjustements = round2(ajustementsInclus.reduce((s, a) => s + (a.montant || 0), 0));
+    const cagnotte = Math.max(0, round2(cagnotteJournaliere + totalAjustements));
     const periodeDebut = dernierePartitionDate;
     // Clé = nom+prénom normalisé (cf. cleEmploye) ; le matricule éventuel est
     // porté par la valeur, pas par la clé.
@@ -1716,8 +1757,8 @@ function App() {
       montant: totalHeures > 0 ? round2(cagnotte * emp.heures / totalHeures) : 0,
     })).sort((a, b) => (a.nom + a.prenom).localeCompare(b.nom + b.prenom));
     const totalReparti = round2(employesAvecPart.reduce((s, emp) => s + emp.montant, 0));
-    return { dernierePartitionDate, joursInclus, cagnotte, periodeDebut, periodeFin: finCagnotte, employesAvecPart, totalHeures, totalReparti };
-  }, [repartitions, rows, employesHeures, AUJOURDHUI]);
+    return { dernierePartitionDate, joursInclus, cagnotte, periodeDebut, periodeFin: finCagnotte, employesAvecPart, totalHeures, totalReparti, ajustementsInclus, totalAjustements };
+  }, [repartitions, rows, employesHeures, AUJOURDHUI, ajustementsPourboires]);
 
   // Même principe que persistDepot : l'état local (setRepartitions, qui
   // remet la cagnotte à zéro et alimente l'Historique pourboires) n'est
@@ -1747,6 +1788,50 @@ function App() {
       }
     });
   }, []);
+  // Correction manuelle du pot pourboires (ex. pourboires laissés par un
+  // employé qui part sans les récupérer, remis dans le pot commun). Même
+  // pattern saveStatus + retry que persistDepot/persistRepartition ci-dessus.
+  const persistAjustementPourboires = useCallback((ajustement) => {
+    setSaveStatus({ kind: "saving", label: `Ajout de ${euro(ajustement.montant)} au pot pourboires…` });
+    ajouterAjustementPourboiresRequest(ajustement).then(res => {
+      if (res.ok) {
+        setSaveStatus({ kind: "ok", label: `✓ ${euro(ajustement.montant)} ajouté(s) au pot pourboires.` });
+        setAjustementsPourboires(prev => [...prev, ajustement]);
+      } else {
+        setSaveStatus({
+          kind: "error",
+          label: `✗ Échec de l'ajout au pot pourboires${res.reason ? " — " + res.reason : ""}`,
+          retry: () => persistAjustementPourboires(ajustement),
+        });
+      }
+    });
+  }, []);
+  const handleAjouterAjustementPourboires = (montant, motif) => {
+    if (!montant || Number.isNaN(montant) || montant === 0) { window.alert("Indique un montant valide."); return; }
+    const ajustement = { date: AUJOURDHUI, montant: round2(montant), motif: motif || "", id: `adj_${Date.now()}_${Math.floor(Math.random() * 1e6)}` };
+    setAjustementMontant("");
+    setAjustementMotif("");
+    persistAjustementPourboires(ajustement);
+  };
+  // Suppression d'une correction (erreur de saisie) — cible une ligne précise
+  // via son "id" (plusieurs corrections peuvent partager la même date, donc
+  // pas de suppression "par date" comme pour les versements).
+  const handleSupprimerAjustementPourboires = (ajustement) => {
+    if (!window.confirm(`Supprimer cette correction de ${euro(ajustement.montant)} (${frDate(ajustement.date)}${ajustement.motif ? " — " + ajustement.motif : ""}) ?`)) return;
+    setSaveStatus({ kind: "saving", label: "Suppression de la correction…" });
+    supprimerAjustementPourboiresRequest(ajustement.id).then(res => {
+      if (res.ok) {
+        setSaveStatus({ kind: "ok", label: "✓ Correction supprimée." });
+        setAjustementsPourboires(prev => prev.filter(a => a.id !== ajustement.id));
+      } else {
+        setSaveStatus({
+          kind: "error",
+          label: `✗ Échec de la suppression${res.reason ? " — " + res.reason : ""}`,
+          retry: () => handleSupprimerAjustementPourboires(ajustement),
+        });
+      }
+    });
+  };
   // Suppression d'un versement depuis l'historique. L'état local n'est mis à
   // jour QUE si le Sheet a réellement confirmé — même principe que partout
   // ailleurs, pour ne pas faire croire à une suppression qui n'a pas eu lieu.
@@ -2231,8 +2316,45 @@ function App() {
               e("span", null, "Pourboires cumulés depuis le dernier versement"), e("span", null, euro0(rc.cagnotte))
             ),
             e("div", { style: { fontSize: 12, color: "#a89b8d", marginBottom: 12 } },
-              `Depuis le ${frDate(rc.periodeDebut)} inclus jusqu'au ${frDate(rc.periodeFin)} (dernier versement : ${frDate(rc.dernierePartitionDate)}) · ${rc.joursInclus.length} jour(s) inclus`
+              `Depuis le ${frDate(rc.periodeDebut)} inclus jusqu'au ${frDate(rc.periodeFin)} (dernier versement : ${frDate(rc.dernierePartitionDate)}) · ${rc.joursInclus.length} jour(s) inclus`,
+              rc.totalAjustements ? ` · dont ${euro(rc.totalAjustements)} de correction(s) manuelle(s)` : ""
             ),
+            e("div", { style: S.divider }),
+            e("div", { style: { fontSize: 11.5, fontWeight: 700, color: "#a89b8d", textTransform: "uppercase", letterSpacing: "0.04em", margin: "10px 0" } }, "Ajouter un montant au pot commun"),
+            e("div", { style: { fontSize: 12, color: "#8a7d70", marginBottom: 8 } },
+              "Ex. pourboires qu'un employé n'est pas venu récupérer avant son départ — remis dans la cagnotte à répartir."
+            ),
+            e("div", { style: { display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" } },
+              e("input", {
+                type: "number", step: "0.01", placeholder: "Montant (€)", value: ajustementMontant,
+                onChange: ev => setAjustementMontant(ev.target.value),
+                style: { width: 110, border: "1px solid #e4dcd0", borderRadius: 5, padding: "6px 8px", font: "inherit", fontSize: 13 }
+              }),
+              e("input", {
+                type: "text", placeholder: "Motif (optionnel)", value: ajustementMotif,
+                onChange: ev => setAjustementMotif(ev.target.value),
+                style: { flex: "1 1 180px", border: "1px solid #e4dcd0", borderRadius: 5, padding: "6px 8px", font: "inherit", fontSize: 13 }
+              }),
+              e("button", {
+                style: S.chip,
+                disabled: !SCRIPT_URL,
+                title: SCRIPT_URL ? "" : "Google Sheets pas encore connecté",
+                onClick: () => handleAjouterAjustementPourboires(parseFloat(ajustementMontant), ajustementMotif),
+              }, "Ajouter au pot")
+            ),
+            rc.ajustementsInclus.length > 0 ? e("div", { style: { marginTop: 10 } },
+              rc.ajustementsInclus.map(a => e("div", {
+                key: a.id,
+                style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, fontSize: 12.5, color: "#6b5f52", padding: "5px 0", borderBottom: "1px solid #f0ebe3" }
+              },
+                e("span", null, frDate(a.date), " · ", euro(a.montant), a.motif ? ` — ${a.motif}` : ""),
+                e("button", {
+                  title: "Supprimer cette correction",
+                  onClick: () => handleSupprimerAjustementPourboires(a),
+                  style: { background: "none", border: "none", color: "#c0392b", cursor: "pointer", fontSize: 12, padding: "0 4px" }
+                }, "✕")
+              ))
+            ) : null,
             e("div", { style: S.divider }),
             e("div", { style: { fontSize: 11.5, fontWeight: 700, color: "#a89b8d", textTransform: "uppercase", letterSpacing: "0.04em", margin: "10px 0" } }, "Import Skello (heures par employé)"),
             e("label", { style: { ...S.chip, ...(skelloFileNames.length ? S.chipDone : {}) } },
