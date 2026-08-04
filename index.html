@@ -33,151 +33,137 @@ const { useState, useMemo, useCallback, useEffect } = React;
 const e = React.createElement;
 
 // ————————————————————————————————————————————————————————
-// Backend Google Sheets (Apps Script) — même pattern que
-// caisse.grupodomingo.io : Web App, dispatch par "action", JSONP pour lire
-// (contourne les soucis CORS), fetch GET/POST classique pour écrire.
-// Projet Apps Script séparé de celui de caisse (aucun risque pour la prod).
-// ————————————————————————————————————————————————————————
-// Déploiement DÉDIÉ, distinct de celui du formulaire de clôture (Caisse/
-// index.html), sur le même script/Sheet.
+// Backend : Cloudflare Worker (code dans cloudflare-worker/), partagé avec le
+// formulaire de clôture (Caisse/index.html) et adossé au même Google Sheet.
 //
-// ⚠️ "Qui a accès" DOIT rester sur "Tout le monde". Ce déploiement était
-// auparavant restreint à grupodomingo.io — son URL contenait alors le segment
-// /a/macros/grupodomingo.io/ — et c'était la cause des échecs de connexion
-// intermittents (03/08) : sur une session Google jugée insuffisante, Google
-// répond une page de connexion HTML au lieu du JavaScript attendu. Le
-// <script> du JSONP échoue alors sans que la page puisse lire la raison,
-// d'où des "JSONP request failed" et des expirations apparemment aléatoires,
-// qui disparaissaient après deux ou trois rechargements.
-// Le JSONP est incompatible avec une URL susceptible de rediriger vers un
-// écran de connexion : si l'accès doit être restreint un jour, il faudra
-// changer de mécanisme de transport, pas seulement ce réglage.
-// La protection repose donc sur RECON_ACCESS_KEY ci-dessous (verrou faible,
-// la clé étant visible dans cette page publique — cf. son commentaire).
-const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxJTaRH3VkmOXGfornNZ4TNNjQWd4VcIc6gWwZxUJFReHJYstttakUSCdiA-CimpwWzJw/exec";
+// Remplace depuis le 04/08 le déploiement Apps Script, abandonné après un
+// taux d'échec d'environ un chargement sur deux. La cause principale était
+// structurelle : Apps Script ne gère pas CORS, ce qui obligeait à tout faire
+// passer par du JSONP, lui-même incapable de distinguer une vraie réponse
+// d'une page de connexion Google renvoyée à la place (d'où les "JSONP request
+// failed" aléatoires qui disparaissaient après deux ou trois rechargements).
+// S'y ajoutaient un POST inutilisable, des exécutions concurrentes refusées
+// et des démarrages à froid de plusieurs secondes.
+//
+// Le Sheet reste la source de vérité et s'utilise exactement comme avant ;
+// seul le chemin d'accès change. La protection repose toujours sur
+// RECON_ACCESS_KEY ci-dessous (verrou faible, la clé étant visible dans cette
+// page publique — cf. son commentaire).
+const SCRIPT_URL = "https://rosario-caisse-api.theodore-0c2.workers.dev";
 // Lien direct vers l'onglet "Clôtures" du classeur (gid=1855935269) — pas
 // une action de l'app, juste un raccourci affiché dans "jours"/"Aide" pour
 // ouvrir le bon endroit où corriger ouverture/dépannage/mis au coffre/esp.
 // comptées. Accès Google (compte grupodomingo.io) requis, indépendant de
 // RECON_ACCESS_KEY.
 const CLOTURES_SHEET_URL = "https://docs.google.com/spreadsheets/d/1m7S6_CDQI4mHGVVY21U49OBSAn_nNJOjLVrPwLWIasU/edit?gid=1855935269#gid=1855935269";
-// Le déploiement Apps Script doit rester "Anyone" (nécessaire pour le JSONP
-// ci-dessous), donc cette clé sert de verrou minimal contre un accès direct
-// au Sheet par quelqu'un qui devine/scanne l'URL sans jamais avoir vu cette
-// page — DOIT être identique à RECON_ACCESS_KEY dans Code.gs (à changer là
-// -bas ET ici si vous voulez une valeur différente de celle par défaut). Ce
-// n'est pas un vrai secret (page publique) : à combiner avec un mot de passe
-// sur la page elle-même (ex. StatiCrypt) pour une vraie protection.
+// L'URL du Worker est publique (pas d'authentification Cloudflare devant),
+// donc cette clé sert de verrou minimal contre un accès direct au Sheet par
+// quelqu'un qui devinerait ou scannerait l'URL sans jamais avoir vu cette
+// page. DOIT être identique au secret RECON_ACCESS_KEY du Worker (à changer
+// aux deux endroits si vous voulez une autre valeur). Ce n'est pas un vrai
+// secret — cette page est publique et la clé y est lisible : à combiner avec
+// un mot de passe sur la page elle-même (ex. StatiCrypt) pour une vraie
+// protection.
 const RECON_ACCESS_KEY = "rk_8f3n2q7xTz51LmPa9WcE4hYs0uBv6R";
 
-let jsonpCounter = 0;
-function jsonp(url) {
-  return new Promise((resolve, reject) => {
-    const cbName = `_recon_cb_${Date.now()}_${jsonpCounter++}`;
-    const script = document.createElement("script");
-    window[cbName] = (data) => { resolve(data); delete window[cbName]; script.remove(); };
-    script.onerror = () => { reject(new Error("JSONP request failed")); delete window[cbName]; script.remove(); };
-    script.src = `${url}${url.includes("?") ? "&" : "?"}callback=${cbName}&t=${Date.now()}`;
-    document.head.appendChild(script);
-  });
-}
-// Chaque appel JSONP est borné dans le temps : si le callback ne se
-// déclenche jamais (ex. déploiement Apps Script qui répond par une page de
-// consentement/login au lieu du JS attendu — ça arrive si "Qui a accès"
-// n'est pas réglé sur "Tout le monde"), la Promise ne se résout ni ne
-// rejette jamais, ce qui bloquait tout le chargement sur "Connexion au
-// Sheet…" indéfiniment sans jamais basculer en erreur.
-// Fabrique commune pour les 4 lectures JSONP simples (get_journalier,
-// get_depots, get_fond_caisse, get_repartitions) — même forme à chaque fois
-// (timeout 12s, fallback silencieux si SCRIPT_URL absent ou erreur/timeout),
-// seuls l'action et la valeur de repli (tableau ou objet vide) changent.
-function fetchAction_(action, fallback) {
-  return async () => {
-    if (!SCRIPT_URL) return fallback;
-    try {
-      const data = await withTimeout(jsonp(`${SCRIPT_URL}?action=${action}&key=${encodeURIComponent(RECON_ACCESS_KEY)}`), 12000);
-      return data && data.status === "ok" ? data.rows : fallback;
-    } catch (err) { return fallback; }
-  };
-}
-const fetchJournalier = fetchAction_("get_journalier", []);
-const fetchDepots = fetchAction_("get_depots", []);
-const fetchFondCaisse = fetchAction_("get_fond_caisse", {});
-const fetchTableRecon = fetchAction_("get_table_recon", []);
-
-// Chargement initial : UN SEUL appel (action get_all) au lieu des cinq
-// lectures ci-dessus lancées en parallèle. Ces cinq appels concurrents
-// déclenchaient autant d'exécutions Apps Script simultanées, dont certaines
-// dépassaient le timeout au premier chargement (démarrage à froid) — et
-// comme fetchAction_ retombe silencieusement sur un tableau vide, l'app
-// affichait des chiffres faux mais crédibles : fenêtre repartant du tout
-// début quand get_depots échouait, tout à zéro quand c'était get_journalier.
-// Deux différences essentielles ici :
-//  1. on distingue "échec" de "vide" — en cas d'échec on renvoie ok:false et
-//     l'appelant bascule sur l'écran d'erreur, au lieu de rendre un tableau
-//     de bord plausible mais faux ;
-//  2. on réessaie deux fois avec un délai croissant, ce qui absorbe le
-//     démarrage à froid sans que Théo ait à recharger la page lui-même.
-// Les cinq lectures repartent EN PARALLÈLE : l'attente vaut la plus lente et
-// non leur somme. Une version intermédiaire les enchaînait dans un seul appel
-// (action get_all), ce qui avait rendu le chargement nettement plus long sans
-// rien apporter — la concurrence entre exécutions Apps Script n'a jamais été
-// démontrée comme responsable des expirations d'origine.
+// Transport des appels au backend. Depuis la migration Apps Script →
+// Cloudflare Worker (04/08), c'est un simple fetch() : le Worker renvoie de
+// vrais en-têtes CORS, ce qu'Apps Script ne faisait pas.
 //
-// Ce qui change par rapport à la version d'avant, et qui est le vrai
-// correctif : une lecture qui échoue n'est plus remplacée en silence par un
-// tableau vide. Promise.all rejette au premier échec, on réessaie une fois,
-// puis on renvoie ok:false — l'app affiche alors un écran d'erreur explicite
-// au lieu d'un tableau de bord plausible mais faux (fenêtre repartant du tout
-// début, ou tout à zéro).
+// Avant, tout passait par du JSONP (injection d'une balise <script> et
+// callback global) — le seul moyen d'appeler Apps Script sans CORS. Ça
+// imposait trois limites dont on hérite encore par endroits : impossible
+// d'utiliser POST (donc tout le payload dans l'URL, d'où les imports par
+// lots), aucun code d'erreur HTTP exploitable (juste "ça a échoué"), et une
+// vulnérabilité aux filtres réseau (cf. l'action renommée en
+// "assistant_ask_sync" parce que le mot "claude" dans une URL était bloqué).
+//
+// On garde volontairement le nom "jsonp" et sa signature (url -> Promise du
+// JSON) pour ne pas avoir à toucher les ~12 appelants : la bascule se fait
+// donc en un seul endroit. Le nom est trompeur, mais un renommage global
+// serait un diff bien plus risqué pour zéro gain fonctionnel.
+async function jsonp(url) {
+  const res = await fetch(url, { method: "GET", headers: { Accept: "application/json" } });
+  const data = await res.json().catch(() => null);
+  // Le Worker répond toujours en JSON, y compris pour ses erreurs
+  // ({status:"error", message}) — on remonte donc le message métier quand il
+  // existe, plutôt qu'un "HTTP 500" opaque.
+  if (!res.ok && !(data && data.status)) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+  return data;
+}
+// POST avec body JSON : réservé aux gros payloads (imports, contexte de
+// l'assistant) qui ne tenaient pas dans une URL du temps d'Apps Script.
+async function apiPost(payload) {
+  const res = await fetch(SCRIPT_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok && !(data && data.status)) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+  return data;
+}
+// Chaque appel reste borné dans le temps : un backend qui ne répond jamais
+// bloquerait sinon tout le chargement sur "Connexion au Sheet…"
+// indéfiniment, sans jamais basculer en erreur.
+//
+// (Retiré le 04/08 : la fabrique fetchAction_ et les cinq lectures unitaires
+// qu'elle produisait — fetchJournalier, fetchDepots, fetchFondCaisse,
+// fetchTableRecon, fetchRepartitions. Plus aucun appelant depuis que
+// fetchAll passe par l'action "bootstrap" ; leur repli silencieux sur un
+// tableau vide en cas d'erreur était de toute façon le comportement qu'on a
+// passé la session à éliminer.)
+
+// Chargement initial : UN SEUL appel ("bootstrap"), qui renvoie d'un coup
+// journalier + dépôts + fond de caisse + répartitions + table recon +
+// ajustements.
+//
+// Cette fusion avait déjà été tentée deux fois du temps d'Apps Script et
+// abandonnée : là-bas, les lectures s'enchaînaient EN SÉRIE dans une seule
+// exécution (donc la somme des temps), et cette exécution unique subissait
+// un démarrage à froid de plusieurs secondes. Six appels parallèles, malgré
+// leurs échecs intermittents, restaient plus rapides.
+//
+// Côté Worker c'est l'inverse : les six lectures partent en parallèle
+// (Promise.all) sur un même jeton d'accès, sans démarrage à froid ni file
+// d'attente. Un aller-retour au lieu de six, et surtout plus de rafale de
+// requêtes concurrentes — c'était la cause des échecs "1 chargement sur 2".
+//
+// Principe conservé : on distingue "échec" de "vide". En cas d'échec on
+// renvoie ok:false et l'appelant bascule sur l'écran d'erreur, au lieu de
+// remplir l'état avec des tableaux vides — ce qui produisait un tableau de
+// bord plausible mais faux (fenêtre repartant du tout début, ou tout à zéro).
 async function fetchAll() {
-  if (!SCRIPT_URL) return { ok: false, reason: "Google Sheets n'est pas connecté." };
-  const lectures = [
-    ["get_journalier",  `&depuis=${HISTORIQUE_DEBUT}`],
-    ["get_depots",      ""],
-    ["get_fond_caisse", ""],
-    ["get_repartitions", ""],
-    ["get_table_recon", `&depuis=${HISTORIQUE_DEBUT}`],
-    ["get_ajustements_pourboires", ""],
-  ];
-  const lire = async ([action, extra]) => {
-    const url = `${SCRIPT_URL}?action=${action}&key=${encodeURIComponent(RECON_ACCESS_KEY)}${extra}`;
-    const data = await withTimeout(jsonp(url), 25000);
-    // "rows" doit être réellement présent : une action inconnue d'un script
-    // pas encore redéployé retombe sur le handler par défaut, qui répond
-    // status:"ok" avec un tout autre contenu.
-    if (!data || data.status !== "ok" || !("rows" in data)) throw new Error("réponse invalide");
-    return data.rows;
-  };
-
-  // Premier passage : les cinq lectures en parallèle, pour la vitesse.
-  // Apps Script refuse régulièrement UNE des requêtes d'une rafale simultanée
-  // (échec HTTP immédiat, "JSONP request failed" via script.onerror — pas une
-  // expiration). Rien d'anormal ni de réparable côté serveur : c'est une
-  // limite de concurrence.
-  const res = await Promise.allSettled(lectures.map(lire));
-  const valeurs = res.map(r => (r.status === "fulfilled" ? r.value : undefined));
-
-  // Second passage : UNIQUEMENT les lectures manquantes, une par une et
-  // espacées. C'est le cœur du correctif — relancer les cinq (ce que faisait
-  // la version précédente) recréait la rafale et donc le même échec, alors
-  // qu'une lecture isolée passe sans difficulté.
-  for (let i = 0; i < lectures.length; i++) {
-    if (valeurs[i] !== undefined) continue;
-    for (let essai = 1; essai <= 3 && valeurs[i] === undefined; essai++) {
-      await new Promise(r => setTimeout(r, 500 * essai));
-      try {
-        valeurs[i] = await lire(lectures[i]);
-      } catch (err) {
-        if (essai === 3) {
-          return { ok: false, reason: `${lectures[i][0]} — ${err.message}` };
-        }
+  if (!SCRIPT_URL) return { ok: false, reason: "Le backend n'est pas configuré." };
+  const url = `${SCRIPT_URL}?action=bootstrap&key=${encodeURIComponent(RECON_ACCESS_KEY)}&depuis=${HISTORIQUE_DEBUT}`;
+  // Deux essais espacés : absorbe un incident réseau ponctuel sans que Théo
+  // ait à recharger la page lui-même.
+  for (let essai = 1; essai <= 2; essai++) {
+    try {
+      const data = await withTimeout(jsonp(url), 30000);
+      if (!data || data.status !== "ok" || !("journalier" in data)) {
+        throw new Error((data && data.message) || "réponse invalide");
       }
+      return {
+        ok: true,
+        data: {
+          journalier: data.journalier || [],
+          depots: data.depots || [],
+          fondCaisse: data.fondCaisse || {},
+          repartitions: data.repartitions || [],
+          tableRecon: data.tableRecon || [],
+          ajustementsPourboires: data.ajustementsPourboires || [],
+        },
+      };
+    } catch (err) {
+      if (essai === 2) return { ok: false, reason: `bootstrap — ${err.message}` };
+      await new Promise(r => setTimeout(r, 800));
     }
   }
-
-  const [journalier, depots, fondCaisse, repartitions, tableRecon, ajustementsPourboires] = valeurs;
-  return { ok: true, data: { journalier, depots, fondCaisse, repartitions, tableRecon, ajustementsPourboires } };
 }
 function serializeParams(obj) {
   const params = new URLSearchParams();
@@ -259,44 +245,24 @@ async function supprimerDernierDepotRequest() {
     return data || { status: "error" };
   } catch (err) { return { status: "error" }; }
 }
-// GET/JSONP synchrone, PAS POST — un POST vers SCRIPT_URL sur ce déploiement
-// est redirigé (302) puis reconverti en GET par le navigateur, perdant le
-// body (donc l'action et les rows). Confirmé le 9/07 : le journal Apps
-// Script "Exécutions" ne montrait QUE des doGet après un import, jamais un
-// doPost, alors que l'app envoyait bien des requêtes POST — celles-ci
-// atterrissaient silencieusement sur la branche par défaut de doGet, sans
-// jamais rien écrire, d'où la sensation de devoir tout réimporter à chaque
-// fois. Même fix que assistant_ask_sync (déjà en GET) : rows/payload passés en
-// paramètre JSON, comme les autres actions de l'app.
+// Imports en masse : un seul POST, tout le lot dans le body JSON.
 //
-// Envoyé par lots (chunks) : une URL GET/JSONP a une limite de taille (côté
-// navigateur ET côté infra Google) — au-delà d'une certaine quantité de
-// lignes, la requête échoue silencieusement (le script ne charge jamais,
-// rien n'apparaît même dans le journal Exécutions puisqu'elle n'atteint
-// jamais le serveur). handleFile ne renvoie déjà que les dates du fichier
-// tout juste importé (pas tout l'historique), mais un import couvrant
-// beaucoup de jours/tables d'un coup pourrait quand même dépasser la
-// limite — le découpage par lots de ${CHUNK_SIZE} lignes s'en protège.
-const IMPORT_CHUNK_SIZE = 30;
-function chunkArray_(arr, size) {
-  const out = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
-}
-async function importBulkAction_(action, rows, chunkSize = IMPORT_CHUNK_SIZE) {
+// Jusqu'au 04/08, ces imports étaient découpés en lots de 30 lignes (10 pour
+// les transactions, plus lourdes) : Apps Script n'acceptant pas de POST
+// exploitable, les lignes voyageaient dans l'URL, dont la longueur est bornée
+// côté navigateur ET côté infra Google. Au-delà, la requête était rejetée
+// avant même d'atteindre le serveur — échec silencieux, invisible jusque dans
+// le journal d'exécutions.
+//
+// Le Worker accepte un vrai POST : plus de limite pratique, donc plus de
+// découpage (moins d'allers-retours, et surtout plus de risque qu'un import
+// réussisse à moitié en s'arrêtant au milieu des lots).
+async function importBulkAction_(action, rows) {
   if (!SCRIPT_URL || rows.length === 0) return { ok: true };
-  const chunks = chunkArray_(rows, chunkSize);
   try {
-    for (let i = 0; i < chunks.length; i++) {
-      const url = `${SCRIPT_URL}?action=${action}&key=${encodeURIComponent(RECON_ACCESS_KEY)}&rows=${encodeURIComponent(JSON.stringify(chunks[i]))}`;
-      const data = await withTimeout(jsonp(url), 20000);
-      // Détail du chunk qui échoue (index/total) + message serveur si présent
-      // (jsonOutput_ renvoie {status:'error', message:...} en cas d'exception
-      // côté Code.gs) — pour ne plus avoir à deviner depuis le journal
-      // Exécutions, qui ne montre pas l'action ni l'erreur exacte.
-      if (!data || data.status !== "ok") {
-        return { ok: false, reason: `${action} — lot ${i + 1}/${chunks.length} : ${(data && data.message) || "réponse invalide"}` };
-      }
+    const data = await withTimeout(apiPost({ action, key: RECON_ACCESS_KEY, rows }), 60000);
+    if (!data || data.status !== "ok") {
+      return { ok: false, reason: `${action} : ${(data && data.message) || "réponse invalide"}` };
     }
     return { ok: true };
   } catch (err) {
@@ -305,33 +271,7 @@ async function importBulkAction_(action, rows, chunkSize = IMPORT_CHUNK_SIZE) {
 }
 async function importJournalierBulk(rows) { return importBulkAction_("import_journalier", rows); }
 async function importTableReconBulk(rows) { return importBulkAction_("import_table_recon", rows); }
-// Lignes bien plus lourdes que les 2 imports ci-dessus (date, heure, source,
-// méthode, montant, table, staff, ET l'identifiant de dédup) — confirmé le
-// 10/07 : à 30 lignes/lot (IMPORT_CHUNK_SIZE), l'URL dépasse ce que l'infra
-// Google accepte et le lot est rejeté avant même d'atteindre doGet ("JSONP
-// request failed", pas une vraie erreur serveur). 10 lignes/lot reste large
-// (~3x moins que journalier/table pour un poids par ligne ~3x plus élevé).
-const TX_IMPORT_CHUNK_SIZE = 10;
-async function importTransactionsBulk(rows) { return importBulkAction_("import_transactions", rows, TX_IMPORT_CHUNK_SIZE); }
-const fetchRepartitions = fetchAction_("get_repartitions", []);
-// Même bug que validerDepotRequest (cf. son commentaire) trouvé le 11/07 en
-// auditant le même type d'action "valider X" : ici le transport était déjà
-// en JSONP (donc plus fiable qu'un fetch() nu), mais le statut de la
-// réponse n'était jamais vérifié (catch vide, résultat ignoré) — une
-// requête qui échoue silencieusement (timeout, erreur serveur) laissait
-// quand même handleValiderRepartition mettre à jour l'état local comme si
-// le versement avait été enregistré.
-// Payload COMPACT (clés d'une lettre, employés en tableaux positionnels
-// [matricule, nom, prénom, heures, montant] plutôt qu'en objets).
-// Tout part dans l'URL d'un GET/JSONP, dont la longueur est limitée côté
-// navigateur ET côté infra Google. Avec une quarantaine de salariés, le
-// format objet complet — noms de champs répétés à chaque ligne, accents
-// gonflés à 6 caractères par encodeURIComponent — dépassait la limite : le
-// <script> n'était alors jamais chargé et l'app affichait "Error: JSONP
-// request failed" au moment de valider (constaté par Théo le 03/08). Le
-// format positionnel divise la taille par deux et laisse de la marge.
-// Ne jamais renvoyer ici l'objet employé complet : il contient aussi des
-// champs internes (cle…) qui n'ont rien à faire dans l'URL ni dans le Sheet.
+async function importTransactionsBulk(rows) { return importBulkAction_("import_transactions", rows); }
 // Supprime toutes les lignes d'un versement (une par employé). Sert à
 // rattraper un versement compté en double — cas rencontré le 03/08, quand une
 // validation avait en réalité abouti côté Sheet malgré l'erreur affichée.
@@ -346,6 +286,16 @@ async function supprimerRepartitionRequest(dateRepartition) {
     return { ok: false, reason: String(err) };
   }
 }
+// Envoi du versement en POST : le payload part dans le body, plus dans l'URL.
+// Le format "compact" (clés d'une lettre, employés en tableaux positionnels
+// [matricule, nom, prénom, heures, montant]) est conservé — il n'a plus
+// d'utilité de taille, mais c'est le format que le backend sait lire, et le
+// changer des deux côtés en même temps serait un risque gratuit. Il évite
+// aussi d'envoyer l'objet employé complet, qui contient des champs internes
+// (cle…) n'ayant rien à faire dans le Sheet.
+//
+// Disparaît au passage : le garde-fou "url.length > 7000" et l'échec au-delà
+// d'une quarantaine de salariés (03/08) — un body JSON n'a pas cette limite.
 async function validerRepartitionRequest(payload) {
   if (!SCRIPT_URL) return { ok: true };
   try {
@@ -358,13 +308,9 @@ async function validerRepartitionRequest(payload) {
         emp.heures || 0, emp.montant || 0,
       ]),
     };
-    const url = `${SCRIPT_URL}?action=valider_repartition&key=${encodeURIComponent(RECON_ACCESS_KEY)}&payload=${encodeURIComponent(JSON.stringify(compact))}`;
-    // Diagnostic explicite plutôt qu'un "JSONP request failed" incompréhensible
-    // si l'effectif devenait un jour trop important pour tenir dans une URL.
-    if (url.length > 7000) {
-      return { ok: false, reason: `trop de salariés pour un seul envoi (${compact.e.length}) — préviens pour passer l'envoi par lots.` };
-    }
-    const data = await withTimeout(jsonp(url), 20000);
+    const data = await withTimeout(apiPost({
+      action: "valider_repartition", key: RECON_ACCESS_KEY, payload: compact,
+    }), 20000);
     if (!data || data.status !== "ok") {
       return { ok: false, code: (data && data.code) || null, reason: (data && data.message) || "réponse invalide" };
     }
@@ -394,38 +340,35 @@ function withTimeout(promise, ms) {
   ]);
 }
 async function askClaudeRequest(question, context, history) {
-  if (!SCRIPT_URL) return "Assistant indisponible : Google Sheets n'est pas connecté.";
-  // Historique tronqué (6 derniers messages) pour garder une URL raisonnable.
+  if (!SCRIPT_URL) return "Assistant indisponible : le backend n'est pas configuré.";
+  // Historique tronqué aux 6 derniers messages : contrairement à avant, ce
+  // n'est plus une contrainte de taille d'URL (on est en POST) mais un choix
+  // de coût et de pertinence — au-delà, le modèle paie un contexte long pour
+  // des échanges qui ne concernent en général plus la question posée.
   const trimmedHistory = (history || []).slice(-6);
-  // Action renommée de "ask_claude_sync" à "assistant_ask_sync" le 11/07 :
-  // la requête échouait INSTANTANÉMENT ((failed), 0 kb, ~250ms dans l'onglet
-  // Réseau) quelle que soit la taille du payload (testé avec joursDetail
-  // filtré à presque rien, historique de conversation vide, ET en navigation
-  // privée) — seul point commun restant : le mot "claude" dans l'URL.
-  // Hypothèse retenue : un filtrage réseau (proxy/sécurité d'entreprise, pas
-  // une extension navigateur vu que la navigation privée ne change rien) qui
-  // bloque les requêtes vers des outils IA reconnus par mot-clé dans l'URL,
-  // indépendamment du domaine (script.google.com n'est pourtant pas un
-  // domaine IA). À confirmer si ce renommage résout le problème.
-  const params = serializeParams({
-    action: "assistant_ask_sync",
-    key: RECON_ACCESS_KEY,
-    question,
-    context: JSON.stringify(context || {}),
-    history: JSON.stringify(trimmedHistory),
-  });
+  // Le nom d'action "assistant_ask_sync" reste tel quel : il avait été
+  // renommé depuis "ask_claude_sync" le 11/07 parce que le mot "claude" dans
+  // l'URL suffisait à faire bloquer la requête par un filtrage réseau
+  // (échec instantané, 0 kb, ~250ms — reproduit en navigation privée, donc
+  // pas une extension). Le passage en POST met désormais l'essentiel du
+  // payload hors de l'URL, mais l'action y figure encore : on ne rejoue pas
+  // ce problème pour le plaisir de retrouver le nom d'origine.
   try {
-    // 90s : une réponse détaillée (croisement de transactions) n'est pas
-    // streamée ici — on attend le texte complet avant de l'afficher, donc
-    // le temps de génération du modèle s'ajoute intégralement au temps de
-    // réponse perçu. max_tokens réduit à 2048 côté Code.gs (+ consigne de
-    // concision) pour rester sous cette limite dans la grande majorité des
-    // cas, mais on garde une marge large plutôt que de couper trop court.
-    const data = await withTimeout(jsonp(`${SCRIPT_URL}?${params.toString()}`), 90000);
+    // 90s : la réponse n'est pas streamée, on attend le texte complet avant
+    // de l'afficher — le temps de génération du modèle s'ajoute donc
+    // intégralement au temps de réponse perçu.
+    const data = await withTimeout(apiPost({
+      action: "assistant_ask_sync",
+      key: RECON_ACCESS_KEY,
+      question,
+      context: context || {},
+      history: trimmedHistory,
+    }), 90000);
     if (data && data.status === "ok" && data.answer !== undefined) return data.answer;
-    return "Réponse inattendue de l'assistant. Vérifie dans Apps Script (menu \"Exécutions\") l'appel assistant_ask_sync le plus récent pour voir l'erreur exacte.";
+    if (data && data.message) return `Erreur de l'assistant : ${data.message}`;
+    return "Réponse inattendue de l'assistant.";
   } catch (err) {
-    return "L'assistant n'a pas répondu à temps (>90s). Vérifie dans l'éditeur Apps Script (menu \"Exécutions\") qu'un appel assistant_ask_sync apparaît bien : aucun appel → redéploie (Gérer les déploiements > crayon > Nouvelle version) ; un appel en erreur → regarde le message affiché (souvent ANTHROPIC_API_KEY manquante).";
+    return "L'assistant n'a pas répondu à temps (>90s). Regarde les journaux du Worker dans le tableau de bord Cloudflare (onglet \"Logs\") pour voir l'erreur exacte — le plus souvent une clé ANTHROPIC_API_KEY manquante ou invalide.";
   }
 }
 
